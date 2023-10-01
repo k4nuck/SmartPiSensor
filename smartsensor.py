@@ -23,16 +23,19 @@ class SmartSensor:
 		self.pin = pin
 		self.use_pulseio = use_pulseio
 
-		# Kick off worker thread
-		self.worker_thread = multiprocessing.Process(target=self.worker)
-		self.worker_thread.start()
-
 		# Sensor
 		self.type = "PiSensor"
+
+		# Kick off worker and timer thread
+		self.worker_thread = multiprocessing.Process(target=self.worker)
+		self.timer_thread = multiprocessing.Process(target=self.timer_worker)
+		self.worker_thread.start()
+		self.timer_thread.start()
 
 	def __del__(self):
 		logging.info("SmartSensor:destroyed")
 		self.worker_thread.terminate()
+		self.timer_thread.terminate()
 
 	# Return object with current temp (c/f) and humidity (as a percentage)	
 	# This is an internal function	
@@ -73,6 +76,16 @@ class SmartSensor:
 				logging.critical("SmartSensor:get_temp_from_sensor:Exception:"+str(error))
 				dhtDevice.exit()
 				raise error
+			
+	# Process for notifying server of delta time has passed
+	def timer_worker(self):
+		logging.info("SmartSensor:TIMER Worker Spawned")
+	
+		#Sleep and then notify parent
+		while True:
+			self.refresh()
+			time.sleep(10)
+			
 	
 	# Handle Refresh
 	def refresh(self):

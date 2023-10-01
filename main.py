@@ -41,7 +41,7 @@ def timer_worker(mainLoopQueue):
 	
 	#Sleep and then notify parent
 	while True:
-		time.sleep(5)
+		time.sleep(60)
 		mainLoopQueue.put({'cmd':"Time", 'data':None})
 
 # Main
@@ -59,8 +59,6 @@ def main():
 
 	# Create Sensor
 	sensor = SmartSensor(board.D4,False)
-	# JB - Shouldnt need to refresh ...
-	sensor.refresh()
 
 	# Create SmartSensorToMTQQ  
 	sensor_to_MTQQ = SmartSensorToMTQQ("PiSensorClient","k4nuck-ubuntu",1883,sensor)
@@ -88,9 +86,7 @@ def main():
 		# Handle Timer Interupt
 		if obj["cmd"]=="Time":
 			logging.info("Main Loop:Sensor Data:"+str(sensor.get_sensor_data()))
-			# JB - shouldnt need to do this ....
-			sensor.refresh()
-
+			
 			# Send sensor data to pipe
 			sensor_to_MTQQ.refresh()
 

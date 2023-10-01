@@ -41,14 +41,14 @@ class SmartSensorToMTQQ:
 	def send_buffer_to_mqtt(self,buffer):
 		topic = self.sensor.get_sensor_type()
 
-		logging.info("SmartSensorMTQQ:send_to_mqtt:Topic:"+str(topic))
-		logging.info("SmartSensorMTQQ:send_to_mqtt:Buffer:"+str(buffer))
+		logging.debug("SmartSensorMTQQ:send_to_mqtt:Topic:"+str(topic))
+		logging.debug("SmartSensorMTQQ:send_to_mqtt:Buffer:"+str(buffer))
 
 		# Send to MQTT Pipe
 		result = self.client.publish(topic, buffer)
 		status = result[0]
 		if status == 0:
-			logging.info("SmartSensorMTQQ:Sent:SUCCESS")
+			logging.debug("SmartSensorMTQQ:Sent:SUCCESS")
 		else:
 			logging.critical("SmartSensorMTQQ:Sent:FAIED")
 
@@ -57,7 +57,7 @@ class SmartSensorToMTQQ:
 	def refresh(self):
 		data = self.sensor.get_sensor_data()
 
-		logging.info("SmartSensorMTQQ:Refresh:"+str(data))
+		logging.debug("SmartSensorMTQQ:Refresh:"+str(data))
 		buffer = json.dumps({"temperature_f":data["temperature_f"],"temperature_c":data["temperature_c"],"humidity":data["humidity"]})
 
 		self.send_buffer_to_mqtt(buffer)
