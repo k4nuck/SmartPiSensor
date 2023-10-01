@@ -1,0 +1,7 @@
+*.pyc
+*.log*
+.vscode
+*workspace
+Pipfile*
+*.fifo
+*pycache*
