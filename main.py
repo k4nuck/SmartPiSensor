@@ -12,7 +12,7 @@ import logging
 import json
 from logging.handlers import RotatingFileHandler
 from smartsensor import *
-from smartsensorToMTQQ import *
+from smartsensorToMQTT import *
 
 # Process for sending commands to the server from command line
 def fifo_worker(mainLoopQueue):
@@ -58,10 +58,10 @@ def main():
 	logging.info( "Smart Temp Started")
 
 	# Create Sensor
-	sensor = SmartSensor(board.D4,False)
+	sensor = SmartSensor(board.D4,False,"sensor","sensorAttic")
 
-	# Create SmartSensorToMTQQ  
-	sensor_to_MTQQ = SmartSensorToMTQQ("PiSensorClient","k4nuck-ubuntu",1883,sensor)
+	# Create SmartSensorToMQTT  
+	sensor_to_MQTT = SmartSensorToMQTT("PiSensorClient","k4nuck-ubuntu",1883,"homeassistant",sensor)
 
 	logging.info("Main:Sensor Data:"+str(sensor.get_sensor_data()))
 
@@ -88,7 +88,7 @@ def main():
 			logging.info("Main Loop:Sensor Data:"+str(sensor.get_sensor_data()))
 			
 			# Send sensor data to pipe
-			sensor_to_MTQQ.refresh()
+			sensor_to_MQTT.refresh()
 
 
 		# Handle Exit

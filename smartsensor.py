@@ -14,8 +14,8 @@ import adafruit_dht
 
 class SmartSensor:
 
-	def __init__(self, pin, use_pulseio):
-		logging.info("SmartSensor:Init:Pin:"+str(pin)+":pulseio:"+str(use_pulseio))
+	def __init__(self, pin, use_pulseio, type, name):
+		logging.info("SmartSensor:Init:Pin:"+str(pin)+":pulseio:"+str(use_pulseio)+":type:"+str(type)+":name:"+str(name))
 		self.mainQueue = multiprocessing.Queue()
 
 		# Default Values for Sensor Data
@@ -24,7 +24,8 @@ class SmartSensor:
 		self.use_pulseio = use_pulseio
 
 		# Sensor
-		self.type = "PiSensor"
+		self.type = type
+		self.name = name
 
 		# Kick off worker and timer thread
 		self.worker_thread = multiprocessing.Process(target=self.worker)
@@ -99,6 +100,10 @@ class SmartSensor:
 	# Returns sensor type
 	def get_sensor_type(self):
 		return self.type
+
+	# Returns Sensor Name
+	def get_sensor_name(self):
+		return self.name
 
 	# Worker thread so that getting Sensor data doesn't block
 	def worker(self):
