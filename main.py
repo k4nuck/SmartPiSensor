@@ -63,8 +63,6 @@ def main():
 	# Create SmartSensorToMQTT  
 	sensor_to_MQTT = SmartSensorToMQTT("PiSensorClient","k4nuck-ubuntu",1883,"homeassistant",sensor)
 
-	logging.info("Main:Sensor Data:"+str(sensor.get_sensor_data()))
-
 	# Create queue
 	mainLoopQueue = multiprocessing.Queue()
 
