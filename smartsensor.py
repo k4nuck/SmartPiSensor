@@ -57,9 +57,9 @@ class SmartSensor:
 			
 				logging.debug("SmartSensor:Before:get_temp_from_sensor:"+str(self.sensor_data))
 
-				self.sensor_data["temperature_f"] = round(temperature_f,2)
-				self.sensor_data["temperature_c"] = round(temperature_c,2)
-				self.sensor_data["humidity"] = humidity
+				self.sensor_data["temperature_f"] = round(temperature_f,1)
+				self.sensor_data["temperature_c"] = round(temperature_c,1)
+				self.sensor_data["humidity"] = round(humidity,0)
 
 				logging.debug("SmartSensor:After:get_temp_from_sensor:"+str(self.sensor_data))
 
