@@ -54,7 +54,9 @@ class SmartSensorToMQTT:
 			logging.critical("SmartSensorMQTT:Sent:FAILED")
 
 	# Return the base topic string
-	def get_base_topic(self):
+	# Subtype is needed to append to sensor name.  IE Temperature sensors.
+	# Need a specific Topic for Temp vs Humidity
+	def get_base_topic(self,subType=""):
 		# discovery name should be the first part of a topic
 		# IE.  Home Assistant uses "homeassistant" as the default 
 		discovery_name = self.discovery_name
@@ -65,38 +67,66 @@ class SmartSensorToMQTT:
 		# Sensor Name
 		sensor_name = self.sensor.get_sensor_name()
 
-		return discovery_name+"/"+sensor_type+"/"+sensor_name
+		return discovery_name+"/"+sensor_type+"/"+sensor_name+subType
 
 	# Return Config Topic
-	def get_config_topic(self):
-		return self.get_base_topic() + "/config"
+	def get_config_topic(self,subType):
+		return self.get_base_topic(subType) + "/config"
 	
 	# Return State Topic
 	def get_state_topic(self):
 		return self.get_base_topic() + "/state"
 	
 	# Return configuration payload
-	def get_config_payload(self):
-		#JB
-		return
+	def get_config_payload(self,subType):
+		if subType == "T":
+			return {"device_class": "temperature",
+						"state_topic": self.get_state_topic(),
+						"unit_of_measurement": "°F",
+						"value_template": "{{ value_json.temperature_f}}",
+						"unique_id": "temp01ae",
+						"device": {"identifiers": ["Attic01ae"], "name": "Attic" }}
+		
+		if subType=="H":
+			return {"device_class": "humidity",
+						"state_topic": self.get_state_topic(),
+						"unit_of_measurement": "%",
+						"value_template": "{{ value_json.humidity}}",
+						"unique_id": "hum01ae",
+						"device": {"identifiers": ["Attic01ae"], "name": "Attic" }}
+		
+		logging.critical("smartSensorMQTT:get_config_payload:Unknown Subtype:"+str(subType))
+		return ""
 
 	# Return state payload
 	def get_state_payload(self):
-		#JB
-		return
+		# State Data is the same format as the sensor object data
+		data = self.sensor.get_sensor_data()
+
+		logging.debug("smartSensorMQTT:get_state_payload:data:"+str(data))
+
+		payload = {"temperature_f":data["temperature_f"],
+			 		"temperature_c":data["temperature_c"],
+					"humidity":data["humidity"]}
+					
+		logging.debug("smartSensorMQTT:get_state_payload:payload:"+str(payload))
+
+		return payload
 
 	
 	# Refresh
 	# JB - For now we will push both Config and State Topics on all refreshes.
 	def refresh(self):
-		data = self.sensor.get_sensor_data()
-
-		# logging.info("SmartSensorMQTT:Refresh:"+str(data))
-		# buffer = json.dumps({"temperature_f":data["temperature_f"],"temperature_c":data["temperature_c"],"humidity":data["humidity"]})
-
+		# JB - Think about how to generalize this more for different sensor types.
 		# Construct Config Topic and payload
-		topic = self.get_config_topic()
-		buffer = json.dumps(self.get_config_payload())
+		# Temperature
+		topic = self.get_config_topic("T")
+		buffer = json.dumps(self.get_config_payload("T"))
+		self.send_buffer_to_mqtt(topic, buffer)
+
+		# Humidity
+		topic = self.get_config_topic("H")
+		buffer = json.dumps(self.get_config_payload("H"))
 		self.send_buffer_to_mqtt(topic, buffer)
 
 		# Construct State Topic and payload
