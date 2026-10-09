@@ -60,8 +60,10 @@ def main():
 	# Create Sensor
 	sensor = SmartSensor(board.D4,False,"sensor","sensorAttic")
 
-	# Create SmartSensorToMQTT  
-	sensor_to_MQTT = SmartSensorToMQTT("PiSensorClient","k4nuck-ubuntu",1883,"homeassistant",sensor)
+	# Create SmartSensorToMQTT
+	# Sending to both Prod and Dev mqtt server  
+	# sensor_to_MQTT_dev = SmartSensorToMQTT("PiSensorClient","k4nuck-ubuntu",1883,"homeassistant",sensor)
+	sensor_to_MQTT_prod = SmartSensorToMQTT("PiSensorClient","192.168.1.252",1883,"homeassistant",sensor)
 
 	# Create queue
 	mainLoopQueue = multiprocessing.Queue()
@@ -86,7 +88,8 @@ def main():
 			logging.info("Main Loop:Sensor Data:"+str(sensor.get_sensor_data()))
 			
 			# Send sensor data to pipe
-			sensor_to_MQTT.refresh()
+			sensor_to_MQTT_prod.refresh()
+			#sensor_to_MQTT_dev.refresh()
 
 
 		# Handle Exit

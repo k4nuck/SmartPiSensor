@@ -45,6 +45,16 @@ class SmartSensor:
 	
 		#Keep trying until we get a proper temperature
 		while True:
+			# JB
+			#temperature_c = 100
+			#temperature_f = temperature_c * (9 / 5) + 32
+			#humidity = 100
+
+			#self.sensor_data["temperature_f"] = round(temperature_f,1)
+			#self.sensor_data["temperature_c"] = round(temperature_c,1)
+			#self.sensor_data["humidity"] = round(humidity,0)
+			#return
+
 			try:
 				temperature_c = dhtDevice.temperature
 				humidity = dhtDevice.humidity
@@ -74,9 +84,21 @@ class SmartSensor:
 				continue
 			except Exception as error:
 				# We shouldn't get here.
-				logging.critical("SmartSensor:get_temp_from_sensor:Exception:"+str(error))
+				logging.critical("SmartSensor:get_temp_from_sensor:Exception:DEAD:"+str(error))
+
+				#temperature_c = 100
+				#temperature_f = temperature_c * (9 / 5) + 32
+				#humidity = 100
+
+				#self.sensor_data["temperature_f"] = round(temperature_f,1)
+				#self.sensor_data["temperature_c"] = round(temperature_c,1)
+				#self.sensor_data["humidity"] = round(humidity,0)
+
 				dhtDevice.exit()
+				#return
 				raise error
+				#time.sleep(2.0)
+				#continue
 			
 	# Process for notifying server of delta time has passed
 	def timer_worker(self):
