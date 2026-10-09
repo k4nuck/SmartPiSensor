@@ -7,6 +7,7 @@
 
 import multiprocessing 
 import logging
+import signal
 import time
 import adafruit_dht
 
@@ -19,7 +20,8 @@ class SmartSensor:
 		self.mainQueue = multiprocessing.Queue()
 
 		# Default Values for Sensor Data
-		self.sensor_data = multiprocessing.Manager().dict({"temperature_f":0.0, "temperature_c":0.0, "humidity":0.0})
+		self.manager = multiprocessing.Manager()
+		self.sensor_data = self.manager.dict({"temperature_f":0.0, "temperature_c":0.0, "humidity":0.0})
 		self.pin = pin
 		self.use_pulseio = use_pulseio
 
@@ -35,8 +37,26 @@ class SmartSensor:
 
 	def __del__(self):
 		logging.info("SmartSensor:destroyed")
-		self.worker_thread.terminate()
-		self.timer_thread.terminate()
+		self.shutdown()
+
+	# Non-daemon children keep the interpreter alive at exit, so they must be stopped explicitly.
+	def shutdown(self):
+		for proc in (self.worker_thread, self.timer_thread):
+			if proc.is_alive():
+				proc.terminate()
+		self.manager.shutdown()
+
+	# Returns (ok, reason). A dead child or Manager leaves the process half-working, so the
+	# supervisor in main.py uses this to decide to exit and let systemd restart us.
+	def check_health(self):
+		for name, proc in (("worker", self.worker_thread), ("timer", self.timer_thread)):
+			if not proc.is_alive():
+				return False, "sensor %s process died (exitcode %s)" % (name, proc.exitcode)
+		try:
+			self.sensor_data.copy()
+		except Exception as error:
+			return False, "sensor data Manager unusable: %r" % (error,)
+		return True, ""
 
 	# Return object with current temp (c/f) and humidity (as a percentage)	
 	# This is an internal function	
@@ -102,6 +122,7 @@ class SmartSensor:
 			
 	# Process for notifying server of delta time has passed
 	def timer_worker(self):
+		signal.signal(signal.SIGTERM, signal.SIG_DFL)
 		logging.info("SmartSensor:TIMER Worker Spawned")
 	
 		#Sleep and then notify parent
@@ -129,6 +150,7 @@ class SmartSensor:
 
 	# Worker thread so that getting Sensor data doesn't block
 	def worker(self):
+		signal.signal(signal.SIGTERM, signal.SIG_DFL)
 		logging.info("Smart Sensor worker thread started:")
 
 		#Main Loop

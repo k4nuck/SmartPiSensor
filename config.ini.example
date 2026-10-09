@@ -1,0 +1,24 @@
+# Copy to config.ini (git-ignored) next to main.py, or point SMARTSENSOR_CONFIG at it.
+# Any key can also be set as an env var: SMARTSENSOR_SENSOR_NAME, SMARTSENSOR_BROKER_HOST, ...
+# Env vars take precedence over this file.
+[sensor]
+sensor_name = sensorAttic
+client_id = PiSensorClient
+broker_host = 192.168.1.252
+broker_port = 1883
+log_path = /home/k4nuck/projects/dht22/dh22.log
+# fifo_path is optional; defaults to temp.fifo in the log_path directory.
+
+# Values in use on 2026-10-08:
+#
+# Bedroom Pi (k4nuck-pi)
+#   sensor_name = sensorAttic
+#   client_id   = PiSensorClient
+#   broker_host = 192.168.1.252
+#   log_path    = /home/k4nuck/projects/dht22/dh22.log
+#
+# Crawlspace Pi (100.123.50.43)
+#   sensor_name = sensorCrawlspace
+#   client_id   = PiSensorClient
+#   broker_host = ha-main-remote.tail9144d.ts.net
+#   log_path    = <its current log filename; confirm on the Pi before deploy>

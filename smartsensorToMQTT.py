@@ -7,6 +7,7 @@
 
 import paho.mqtt.client as mqtt 
 import logging
+import time
 from smartsensor import *
 import json
 
@@ -16,6 +17,20 @@ def on_connect(client, userdata, flags, rcode):
 		logging.info("SmartSensorMQTT:Connected")
 	else:
 		logging.info("SmartSensorMQTT:Failed Connect:rcode:", rcode)
+
+# At boot the broker name (Tailscale MagicDNS) may not resolve yet, and the broker may be down;
+# retry forever with capped backoff rather than crash. A SIGTERM during the sleep exits via SystemExit.
+def connect_with_backoff(client, broker_hostname, port, sleep=time.sleep, initial_delay=1, max_delay=60):
+	delay = initial_delay
+	while True:
+		try:
+			client.connect(broker_hostname, port)
+			return
+		except OSError as error:
+			# socket.gaierror (DNS) and ConnectionError are both OSError subclasses
+			logging.warning("SmartSensorMQTT:connect failed (%s), retrying in %ss" % (error, delay))
+			sleep(delay)
+			delay = min(delay * 2, max_delay)
 
 # Handle Getting Sensor data and pushing it on an MQTT
 class SmartSensorToMQTT:
@@ -28,7 +43,7 @@ class SmartSensorToMQTT:
 		self.client.on_connect=on_connect
 
 		# Connect to broker
-		self.client.connect(broker_hostname, port)
+		connect_with_backoff(self.client, broker_hostname, port)
 		self.client.loop_start()
 
 		self.sensor = sensor
