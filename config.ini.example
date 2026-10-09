@@ -1,0 +1,40 @@
+# Copy to config.ini (git-ignored) next to main.py, or point SMARTSENSOR_CONFIG at it.
+# Any key can also be set as an env var: SMARTSENSOR_SENSOR_NAME, SMARTSENSOR_BROKER_HOST, ...
+# Env vars take precedence over this file.
+#
+# The four HA identity keys (device_id, device_name, temp_unique_id, hum_unique_id) default to the
+# bedroom values below. A Pi that omits them publishes AS the bedroom's HA entities, so every other
+# Pi MUST set all four.
+[sensor]
+sensor_name = sensorAttic
+client_id = PiSensorClient
+broker_host = 192.168.1.252
+broker_port = 1883
+log_path = /home/k4nuck/projects/dht22/dh22.log
+device_id = Attic01ae
+device_name = Attic
+temp_unique_id = temp01ae
+hum_unique_id = hum01ae
+# fifo_path is optional; defaults to temp.fifo in the log_path directory.
+
+# Values in use on 2026-10-08:
+#
+# Bedroom Pi (k4nuck-pi)
+#   sensor_name    = sensorAttic
+#   client_id      = PiSensorClient
+#   broker_host    = 192.168.1.252
+#   log_path       = /home/k4nuck/projects/dht22/dh22.log
+#   device_id      = Attic01ae
+#   device_name    = Attic
+#   temp_unique_id = temp01ae
+#   hum_unique_id  = hum01ae
+#
+# Crawlspace Pi (100.123.50.43)
+#   sensor_name    = sensorCrawlspace
+#   client_id      = PiSensorClientCrawlspace
+#   broker_host    = ha-main-remote.tail9144d.ts.net
+#   log_path       = /home/k4nuck/projects/dht22/dht22.log
+#   device_id      = Crawlspace01
+#   device_name    = Crawlspace
+#   temp_unique_id = tempCrawl01
+#   hum_unique_id  = humCrawl01

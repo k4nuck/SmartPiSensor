@@ -7,8 +7,19 @@
 
 import multiprocessing 
 import logging
+import signal
+import threading
 import time
 import adafruit_dht
+from multiprocessing.managers import SyncManager
+from procutil import stop_processes
+
+# Upper bound on one Manager round trip; a stopped or hung Manager would otherwise block forever
+MANAGER_PROBE_SECONDS = 3
+
+# The Manager server forks from a process whose SIGTERM handler raises SystemExit; it must die on SIGTERM instead.
+def _manager_init():
+	signal.signal(signal.SIGTERM, signal.SIG_DFL)
 
 # Handle Custom Smart Sensors
 
@@ -16,10 +27,13 @@ class SmartSensor:
 
 	def __init__(self, pin, use_pulseio, type, name):
 		logging.info("SmartSensor:Init:Pin:"+str(pin)+":pulseio:"+str(use_pulseio)+":type:"+str(type)+":name:"+str(name))
-		self.mainQueue = multiprocessing.Queue()
 
-		# Default Values for Sensor Data
-		self.sensor_data = multiprocessing.Manager().dict({"temperature_f":0.0, "temperature_c":0.0, "humidity":0.0})
+		# Set before anything that can fail so shutdown() is safe on a half-built object
+		self.manager = None
+		self.worker_thread = None
+		self.timer_thread = None
+		self._closed = False
+
 		self.pin = pin
 		self.use_pulseio = use_pulseio
 
@@ -27,16 +41,67 @@ class SmartSensor:
 		self.type = type
 		self.name = name
 
-		# Kick off worker and timer thread
-		self.worker_thread = multiprocessing.Process(target=self.worker)
-		self.timer_thread = multiprocessing.Process(target=self.timer_worker)
-		self.worker_thread.start()
-		self.timer_thread.start()
+		# A SIGTERM or start() failure mid-construction would otherwise leak already-started non-daemon children,
+		# because the caller never receives the object to shut down.
+		try:
+			self.mainQueue = multiprocessing.Queue()
+
+			# Default Values for Sensor Data
+			self.manager = SyncManager()
+			self.manager.start(_manager_init)
+			self.sensor_data = self.manager.dict({"temperature_f":0.0, "temperature_c":0.0, "humidity":0.0})
+
+			# Kick off worker and timer thread
+			self.worker_thread = multiprocessing.Process(target=self.worker)
+			self.timer_thread = multiprocessing.Process(target=self.timer_worker)
+			self.worker_thread.start()
+			self.timer_thread.start()
+		except BaseException:
+			self.shutdown()
+			raise
 
 	def __del__(self):
 		logging.info("SmartSensor:destroyed")
-		self.worker_thread.terminate()
-		self.timer_thread.terminate()
+		self.shutdown()
+
+	# Non-daemon children keep the interpreter alive at exit, so they must be stopped explicitly.
+	def shutdown(self):
+		if self._closed:
+			return
+		self._closed = True
+		stop_processes([self.worker_thread, self.timer_thread])
+		if self.manager is not None:
+			# manager.shutdown() sends an RPC first, which never returns if the Manager is stopped.
+			# Killing the server process first makes its finalizer skip the RPC and just clean up.
+			stop_processes([getattr(self.manager, "_process", None)])
+			try:
+				self.manager.shutdown()
+			except Exception:
+				logging.warning("SmartSensor:Manager shutdown failed", exc_info=True)
+
+	# Returns (ok, reason). A dead child or Manager leaves the process half-working, so the
+	# supervisor in main.py uses this to decide to exit and let systemd restart us.
+	def check_health(self):
+		for name, proc in (("worker", self.worker_thread), ("timer", self.timer_thread),
+				("manager", getattr(self.manager, "_process", None))):
+			if proc is not None and not proc.is_alive():
+				return False, "sensor %s process died (exitcode %s)" % (name, proc.exitcode)
+
+		# A proxy call blocks indefinitely on a stopped Manager, so probe from a thread we can abandon
+		outcome = {}
+		def probe():
+			try:
+				self.sensor_data.copy()
+			except Exception as error:
+				outcome["error"] = error
+		prober = threading.Thread(target=probe, daemon=True)
+		prober.start()
+		prober.join(MANAGER_PROBE_SECONDS)
+		if prober.is_alive():
+			return False, "sensor data Manager unresponsive for %ss" % MANAGER_PROBE_SECONDS
+		if "error" in outcome:
+			return False, "sensor data Manager unusable: %r" % (outcome["error"],)
+		return True, ""
 
 	# Return object with current temp (c/f) and humidity (as a percentage)	
 	# This is an internal function	
@@ -102,6 +167,7 @@ class SmartSensor:
 			
 	# Process for notifying server of delta time has passed
 	def timer_worker(self):
+		signal.signal(signal.SIGTERM, signal.SIG_DFL)
 		logging.info("SmartSensor:TIMER Worker Spawned")
 	
 		#Sleep and then notify parent
@@ -129,6 +195,7 @@ class SmartSensor:
 
 	# Worker thread so that getting Sensor data doesn't block
 	def worker(self):
+		signal.signal(signal.SIGTERM, signal.SIG_DFL)
 		logging.info("Smart Sensor worker thread started:")
 
 		#Main Loop

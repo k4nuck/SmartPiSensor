@@ -5,3 +5,4 @@
 Pipfile*
 *.fifo
 *pycache*
+config.ini
