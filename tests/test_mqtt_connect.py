@@ -35,3 +35,17 @@ def test_config_payload_uses_configured_identity():
 	t, h = m.get_config_payload("T"), m.get_config_payload("H")
 	assert (t["unique_id"], h["unique_id"]) == ("tempCrawl01", "humCrawl01")
 	assert t["device"] == h["device"] == {"identifiers": ["Crawlspace01"], "name": "Crawlspace"}
+
+def test_supervise_runs_during_backoff_and_can_abort():
+	from smartsensorToMQTT import SupervisionFailure
+	client = mock.Mock()
+	client.connect.side_effect = OSError("down")
+	calls = []
+	def supervise():
+		calls.append(1)
+		if len(calls) >= 6:
+			raise SupervisionFailure("sensor died")
+	sleeps = []
+	with pytest.raises(SupervisionFailure):
+		connect_with_backoff(client, "h", 1883, sleep=sleeps.append, supervise=supervise, supervise_interval=1, max_delay=8)
+	assert len(calls) == 6 and set(sleeps) == {1}

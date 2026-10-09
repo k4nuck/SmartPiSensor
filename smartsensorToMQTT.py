@@ -18,23 +18,40 @@ def on_connect(client, userdata, flags, rcode):
 	else:
 		logging.info("SmartSensorMQTT:Failed Connect:rcode:", rcode)
 
+# Raised by the supervise callback when a sibling process died while we were still connecting
+class SupervisionFailure(Exception):
+	pass
+
+# How often retry waits wake to run the supervise callback
+SUPERVISE_INTERVAL_SECONDS = 5
+
 # At boot the broker name (Tailscale MagicDNS) may not resolve yet, and the broker may be down;
 # retry forever with capped backoff rather than crash. A SIGTERM during the sleep exits via SystemExit.
-def connect_with_backoff(client, broker_hostname, port, sleep=time.sleep, initial_delay=1, max_delay=60):
+# supervise() runs throughout so a child dying during a long outage still ends the process (it raises to abort).
+def connect_with_backoff(client, broker_hostname, port, sleep=time.sleep, initial_delay=1, max_delay=60,
+		supervise=None, supervise_interval=SUPERVISE_INTERVAL_SECONDS):
 	delay = initial_delay
 	while True:
+		if supervise:
+			supervise()
 		try:
 			client.connect(broker_hostname, port)
 			return
 		except OSError as error:
 			# socket.gaierror (DNS) and ConnectionError are both OSError subclasses
 			logging.warning("SmartSensorMQTT:connect failed (%s), retrying in %ss" % (error, delay))
-			sleep(delay)
+			remaining = delay
+			while remaining > 0:
+				step = min(remaining, supervise_interval)
+				sleep(step)
+				remaining -= step
+				if supervise:
+					supervise()
 			delay = min(delay * 2, max_delay)
 
 # Handle Getting Sensor data and pushing it on an MQTT
 class SmartSensorToMQTT:
-	def __init__(self, client, broker_hostname, port, discovery_name,sensor, device_id="Attic01ae", device_name="Attic", temp_unique_id="temp01ae", hum_unique_id="hum01ae"):
+	def __init__(self, client, broker_hostname, port, discovery_name,sensor, device_id="Attic01ae", device_name="Attic", temp_unique_id="temp01ae", hum_unique_id="hum01ae", supervise=None):
 
 		logging.info("SmartSensorMQTT:Init")
 
@@ -43,7 +60,7 @@ class SmartSensorToMQTT:
 		self.client.on_connect=on_connect
 
 		# Connect to broker
-		connect_with_backoff(self.client, broker_hostname, port)
+		connect_with_backoff(self.client, broker_hostname, port, supervise=supervise)
 		self.client.loop_start()
 
 		self.sensor = sensor

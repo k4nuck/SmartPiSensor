@@ -11,7 +11,7 @@ import main as sensor_main
 
 class FakeProc:
 	def __init__(self, alive=True, exitcode=None):
-		self.alive, self.exitcode, self.terminated = alive, exitcode, False
+		self.alive, self.exitcode, self.terminated, self.pid = alive, exitcode, False, 1234
 	def is_alive(self): return self.alive
 	def terminate(self): self.terminated = True; self.alive = False
 	def kill(self): self.alive = False
@@ -34,11 +34,6 @@ def test_find_failure_dead_manager():
 	s.check_health.return_value = (False, "sensor data Manager unusable")
 	assert "Manager" in sensor_main.find_failure({"fifo": FakeProc()}, s)
 
-def test_stop_children_terminates_live_and_kills_stubborn():
-	live, stubborn = FakeProc(), FakeProc()
-	stubborn.terminate = lambda: None  # ignores SIGTERM
-	sensor_main.stop_children([live, stubborn])
-	assert live.terminated and not stubborn.alive
 
 @pytest.fixture
 def patched_main(tmp_path, monkeypatch):
@@ -95,3 +90,63 @@ def test_sigterm_real_process_exits_quickly(tmp_path):
 	assert proc.poll() is None
 	proc.send_signal(signal.SIGTERM)
 	assert proc.wait(timeout=10) == 0
+
+
+def test_main_cleans_up_when_second_child_fails_to_start(patched_main, monkeypatch):
+	"""start() failing leaves an unstarted Process; its join() asserts, which must not skip sensor.shutdown()."""
+	cfg, procs, sensor = patched_main
+	class Unstarted(FakeProc):
+		pid = None
+		def start(self): raise OSError("fork failed")
+		def join(self, t=None): raise AssertionError("can only join a started process")
+	made = []
+	def make_proc(*a, **k):
+		p = Unstarted() if made else FakeProc()
+		p.start = p.start if made else (lambda: None)
+		made.append(p); return p
+	monkeypatch.setattr(sensor_main.multiprocessing, "Process", make_proc)
+	assert sensor_main.main(cfg) == 1
+	assert made[0].terminated
+	sensor.shutdown.assert_called()
+
+def test_main_shuts_down_sensor_when_cleanup_step_raises(patched_main):
+	cfg, procs, sensor = patched_main
+	sensor.check_health.return_value = (False, "gone")
+	sensor.shutdown.side_effect = RuntimeError("boom")
+	assert sensor_main.main(cfg) == 1
+
+def test_main_exits_nonzero_when_child_dies_during_broker_retries(patched_main, monkeypatch):
+	"""connect_with_backoff retries forever; supervision must still notice the dead sensor child."""
+	cfg, procs, sensor = patched_main
+	sensor.check_health.return_value = (False, "sensor worker process died")
+	import smartsensorToMQTT
+	client = mock.Mock()
+	client.connect.side_effect = OSError("no route")
+	monkeypatch.setattr(smartsensorToMQTT.mqtt, "Client", lambda *a, **k: client)
+	monkeypatch.setattr(smartsensorToMQTT.time, "sleep", lambda s: None)
+	monkeypatch.setattr(sensor_main, "SmartSensorToMQTT", smartsensorToMQTT.SmartSensorToMQTT)
+	monkeypatch.setattr(smartsensorToMQTT.connect_with_backoff, "__defaults__",
+		(lambda s: None,) + smartsensorToMQTT.connect_with_backoff.__defaults__[1:])
+	assert sensor_main.main(cfg) == 1
+	assert client.connect.call_count <= 1  # aborted by supervision, not retried indefinitely
+	sensor.shutdown.assert_called()
+
+def test_sigterm_during_sensor_construction_still_exits(tmp_path):
+	"""Real children: SIGTERM while SmartSensor() is still constructing must not leave a hung non-daemon child."""
+	root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+	cfg = tmp_path / "config.ini"
+	cfg.write_text("[sensor]\nsensor_name=s\nclient_id=c\nbroker_host=h\nlog_path=%s/t.log\n" % tmp_path)
+	script = (
+		"import sys, time, multiprocessing\nsys.path.insert(0, %r)\nsys.path.insert(0, %r)\n"
+		"import conftest, smartsensor, main\n"
+		"orig = multiprocessing.Process.start\n"
+		"n = [0]\n"
+		"def slow_start(self):\n"
+		"    orig(self); n[0] += 1\n"
+		"    if n[0] == 1: print('READY', flush=True); time.sleep(30)\n"
+		"multiprocessing.Process.start = slow_start\n"
+		"sys.exit(main.main(%r))\n" % (root, os.path.join(root, "tests"), str(cfg)))
+	proc = subprocess.Popen([sys.executable, "-c", script], stdout=subprocess.PIPE, text=True)
+	assert proc.stdout.readline().strip() == "READY"
+	proc.send_signal(signal.SIGTERM)
+	assert proc.wait(timeout=15) == 0

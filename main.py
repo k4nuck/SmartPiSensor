@@ -17,6 +17,7 @@ from logging.handlers import RotatingFileHandler
 from config import load_config
 from smartsensor import *
 from smartsensorToMQTT import *
+from procutil import stop_processes
 
 # Process for sending commands to the server from command line
 def fifo_worker(mainLoopQueue, path):
@@ -50,22 +51,12 @@ def timer_worker(mainLoopQueue):
 
 # How often the main loop wakes to check on its children when no message arrives
 HEALTH_CHECK_SECONDS = 5
-CHILD_STOP_SECONDS = 2
 
 # Systemd sends SIGTERM; raising SystemExit unwinds main()'s finally block, which stops the children.
+# Later SIGTERMs are ignored so a repeated stop can't interrupt that cleanup (its waits are bounded anyway).
 def handle_sigterm(signum, frame):
+	signal.signal(signal.SIGTERM, signal.SIG_IGN)
 	raise SystemExit(0)
-
-# Non-daemon children would otherwise block interpreter exit, which is how the service hung "active".
-def stop_children(children):
-	for child in children:
-		if child.is_alive():
-			child.terminate()
-	for child in children:
-		child.join(CHILD_STOP_SECONDS)
-		if child.is_alive():
-			child.kill()
-			child.join(CHILD_STOP_SECONDS)
 
 # Returns a reason string if any child (or the sensor's Manager) is dead, else None
 def find_failure(children, sensor):
@@ -101,10 +92,16 @@ def main(config_path=None):
 		# Create Sensor
 		sensor = SmartSensor(board.D4,False,"sensor",config["sensor_name"])
 
+		# Connecting can retry for as long as the broker is down, so children must be supervised meanwhile
+		def supervise():
+			failure = find_failure(children, sensor)
+			if failure:
+				raise SupervisionFailure(failure)
+
 		# Create SmartSensorToMQTT
 		sensor_to_MQTT_prod = SmartSensorToMQTT(config["client_id"],config["broker_host"],config["broker_port"],"homeassistant",sensor,
 			device_id=config["device_id"],device_name=config["device_name"],
-			temp_unique_id=config["temp_unique_id"],hum_unique_id=config["hum_unique_id"])
+			temp_unique_id=config["temp_unique_id"],hum_unique_id=config["hum_unique_id"],supervise=supervise)
 
 		# Create queue
 		mainLoopQueue = multiprocessing.Queue()
@@ -143,6 +140,9 @@ def main(config_path=None):
 			if obj["cmd"]=="exit":
 				logging.info( "Smart Pump: Quitting")
 				return 0
+	except SupervisionFailure as failure:
+		logging.critical("Smart Temp: %s; exiting so systemd restarts us" % failure)
+		return 1
 	except SystemExit:
 		logging.info("Smart Temp: SIGTERM received, shutting down")
 		return 0
@@ -151,9 +151,12 @@ def main(config_path=None):
 		logging.critical("Smart Temp: fatal error", exc_info=True)
 		return 1
 	finally:
-		stop_children(list(children.values()))
+		stop_processes(list(children.values()))
 		if sensor is not None:
-			sensor.shutdown()
+			try:
+				sensor.shutdown()
+			except Exception:
+				logging.warning("Smart Temp: sensor shutdown failed", exc_info=True)
 
 if __name__ == '__main__':
 	sys.exit(main())
