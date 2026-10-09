@@ -41,3 +41,14 @@ def test_example_file_is_loadable():
 	import os
 	example = os.path.join(os.path.dirname(os.path.dirname(__file__)), "config.ini.example")
 	assert load_config(example, environ={})["broker_host"] == "192.168.1.252"
+
+def test_identity_defaults_to_bedroom_values(tmp_path):
+	cfg = load_config(write(tmp_path), environ={})
+	assert (cfg["device_id"], cfg["device_name"], cfg["temp_unique_id"], cfg["hum_unique_id"]) == \
+		("Attic01ae", "Attic", "temp01ae", "hum01ae")
+
+def test_identity_read_from_file(tmp_path):
+	ini = INI + "device_id = Crawlspace01\ndevice_name = Crawlspace\ntemp_unique_id = tempCrawl01\nhum_unique_id = humCrawl01\n"
+	cfg = load_config(write(tmp_path, ini), environ={})
+	assert (cfg["device_id"], cfg["device_name"], cfg["temp_unique_id"], cfg["hum_unique_id"]) == \
+		("Crawlspace01", "Crawlspace", "tempCrawl01", "humCrawl01")

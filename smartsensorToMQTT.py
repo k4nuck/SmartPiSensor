@@ -34,7 +34,7 @@ def connect_with_backoff(client, broker_hostname, port, sleep=time.sleep, initia
 
 # Handle Getting Sensor data and pushing it on an MQTT
 class SmartSensorToMQTT:
-	def __init__(self, client, broker_hostname, port, discovery_name,sensor):
+	def __init__(self, client, broker_hostname, port, discovery_name,sensor, device_id="Attic01ae", device_name="Attic", temp_unique_id="temp01ae", hum_unique_id="hum01ae"):
 
 		logging.info("SmartSensorMQTT:Init")
 
@@ -48,6 +48,10 @@ class SmartSensorToMQTT:
 
 		self.sensor = sensor
 		self.discovery_name = discovery_name
+		self.device_id = device_id
+		self.device_name = device_name
+		self.temp_unique_id = temp_unique_id
+		self.hum_unique_id = hum_unique_id
 	 
 	def __del__(self):
 		logging.info("SmartSensorMQTT:destroyed")
@@ -99,16 +103,16 @@ class SmartSensorToMQTT:
 						"state_topic": self.get_state_topic(),
 						"unit_of_measurement": "°F",
 						"value_template": "{{ value_json.temperature_f}}",
-						"unique_id": "temp01ae",
-						"device": {"identifiers": ["Attic01ae"], "name": "Attic" }}
+						"unique_id": self.temp_unique_id,
+						"device": {"identifiers": [self.device_id], "name": self.device_name }}
 		
 		if subType=="H":
 			return {"device_class": "humidity",
 						"state_topic": self.get_state_topic(),
 						"unit_of_measurement": "%",
 						"value_template": "{{ value_json.humidity}}",
-						"unique_id": "hum01ae",
-						"device": {"identifiers": ["Attic01ae"], "name": "Attic" }}
+						"unique_id": self.hum_unique_id,
+						"device": {"identifiers": [self.device_id], "name": self.device_name }}
 		
 		logging.critical("smartSensorMQTT:get_config_payload:Unknown Subtype:"+str(subType))
 		return ""

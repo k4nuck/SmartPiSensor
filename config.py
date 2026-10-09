@@ -20,6 +20,19 @@ KEYS = {
 	"broker_port": False,
 	"log_path": True,
 	"fifo_path": False,
+	"device_id": False,
+	"device_name": False,
+	"temp_unique_id": False,
+	"hum_unique_id": False,
+}
+
+# The HA discovery identity is per-Pi: two Pis sharing these would overwrite each other's HA entities.
+# Defaults are the bedroom Pi's values so an unset key leaves its payloads unchanged.
+IDENTITY_DEFAULTS = {
+	"device_id": "Attic01ae",
+	"device_name": "Attic",
+	"temp_unique_id": "temp01ae",
+	"hum_unique_id": "hum01ae",
 }
 
 class ConfigError(Exception):
@@ -63,4 +76,5 @@ def load_config(path=None, environ=None):
 		"log_path": log_path,
 		# The FIFO sits beside the log because both need a directory the service user can write.
 		"fifo_path": values.get("fifo_path") or os.path.join(os.path.dirname(log_path), "temp.fifo"),
+		**{k: values.get(k) or default for k, default in IDENTITY_DEFAULTS.items()},
 	}

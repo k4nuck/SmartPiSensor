@@ -102,7 +102,9 @@ def main(config_path=None):
 		sensor = SmartSensor(board.D4,False,"sensor",config["sensor_name"])
 
 		# Create SmartSensorToMQTT
-		sensor_to_MQTT_prod = SmartSensorToMQTT(config["client_id"],config["broker_host"],config["broker_port"],"homeassistant",sensor)
+		sensor_to_MQTT_prod = SmartSensorToMQTT(config["client_id"],config["broker_host"],config["broker_port"],"homeassistant",sensor,
+			device_id=config["device_id"],device_name=config["device_name"],
+			temp_unique_id=config["temp_unique_id"],hum_unique_id=config["hum_unique_id"])
 
 		# Create queue
 		mainLoopQueue = multiprocessing.Queue()
