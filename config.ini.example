@@ -57,3 +57,15 @@ hum_unique_id = hum01ae
 # thermostat_unit = c
 # setpoint_floor_f = 45
 # setpoint_ceiling_f = 65
+# thermostat_allowed_modes = heat
+#
+# Contract v1.1: thermostat_name may list several thermostats, comma-separated; each is reported and controlled
+# under its own name. The four thermostat_* / setpoint_* keys above are the defaults for all of them, and a
+# [thermostat:<name>] section overrides them for one. The Pi enforces these bounds and allowed modes itself, so a
+# desired change outside them is answered rejected_bounds and never written. The allowed-modes default is
+# heat only (any of heat, off, cool, auto), so a desired system_mode of off is rejected unless a thermostat opts in.
+#
+# [thermostat:crawlspace_thermostat]
+# setpoint_floor_f = 45
+# setpoint_ceiling_f = 65
+# thermostat_allowed_modes = heat

@@ -4,7 +4,8 @@
 #  checkin.py
 #
 # Outbound-only HTTPS check-in transport (gergy-incidents#1558, parent #1555): reports the DHT22 and a
-# local zigbee2mqtt thermostat to gergy-edge and applies the setpoint the reply asks for.
+# local zigbee2mqtt thermostats to gergy-edge and applies the setpoint/mode changes the reply asks for.
+# Contract v1.1: every thermostat-related field is a map keyed by thermostat name.
 
 import json
 import logging
@@ -22,8 +23,9 @@ POST_TIMEOUT_SECONDS = 10
 # How long a published setpoint may go unechoed by zigbee2mqtt before it is reported failed
 CONFIRM_TIMEOUT_SECONDS = 90
 MAX_REPLY_BYTES = 64 * 1024
-# TH1124ZB setpoint resolution
-SETPOINT_STEP_C = 0.5
+# Device setpoint resolution: the TH1124ZB steps 0.5 C, a Fahrenheit-configured one steps 1 F
+SETPOINT_STEP = {"c": 0.5, "f": 1.0}
+SYSTEM_MODES = ("heat", "off", "cool", "auto")
 
 class CheckinError(Exception):
 	pass
@@ -135,15 +137,15 @@ class ThermostatState:
 		with self._lock:
 			return self._available is True
 
-	# The setpoint (in device units) if a message carrying it arrived at or after `since`, else None
-	def setpoint_since(self, since):
+	# The field's value if a message carrying it arrived at or after `since`, else None
+	def field_since(self, key, since):
 		with self._lock:
-			entry = self._fields.get("occupied_heating_setpoint")
+			entry = self._fields.get(key)
 		if entry is None or entry[1] < since:
 			return None
-		return number(entry[0])
+		return entry[0]
 
-	# The contract's "thermostat" stream, or None when nothing has been heard from it
+	# One thermostat's entry in the contract's "thermostats" map, or None when nothing has been heard from it
 	def snapshot(self):
 		with self._lock:
 			fields, available = dict(self._fields), self._available
@@ -174,28 +176,56 @@ class ThermostatState:
 		out["reading_at"] = iso_utc(fields["local_temperature"][1] if "local_temperature" in fields else max(reported))
 		return out
 
+# One configured thermostat: its topics, its own device-side limits, and its per-version write state
+class Thermostat:
+	def __init__(self, name, settings):
+		self.name = name
+		self.floor = settings["floor_f"]
+		self.ceiling = settings["ceiling_f"]
+		self.allowed_modes = tuple(settings["allowed_modes"])
+		self.state = ThermostatState(settings["unit"])
+		self.step = SETPOINT_STEP[settings["unit"]]
+		self.state_topic = "zigbee2mqtt/" + name
+		self.availability_topic = self.state_topic + "/availability"
+		self.set_topic = self.state_topic + "/set"
+		# (version, result) of the last desired change acted on; a repeat of it is not re-applied
+		self.handled = None
+		# (version, {field: device-unit value}, written_at) of a write the thermostat hasn't echoed back yet
+		self.unconfirmed = None
+
+	def in_bounds(self, setpoint_f):
+		return self.floor <= setpoint_f <= self.ceiling
+
+	# Round to the thermostat's step, nudged back inside the bounds if rounding crossed one
+	def device_setpoint(self, setpoint_f):
+		value = round(self.state.to_device_units(setpoint_f) / self.step) * self.step
+		while self.state.to_f(value) < self.floor:
+			value += self.step
+		while self.state.to_f(value) > self.ceiling:
+			value -= self.step
+		return value
+
+	# The thermostat quantizes what it is given, so an echo is compared on its step, not to the float
+	def same_setpoint(self, a, b):
+		return round(a / self.step) == round(b / self.step)
+
 class CheckinBridge:
 	def __init__(self, config, sensor, post=http_post, clock=time.time, mqtt_client=None):
 		self.sensor = sensor
 		self.device_id = config["device_id"]
 		self.url = config["checkin_url"]
 		self.token = config["checkin_token"]
-		self.floor = config["setpoint_floor_f"]
-		self.ceiling = config["setpoint_ceiling_f"]
-		self.thermostat = ThermostatState(config["thermostat_unit"])
-		self.state_topic = "zigbee2mqtt/" + config["thermostat_name"]
-		self.availability_topic = self.state_topic + "/availability"
-		self.set_topic = self.state_topic + "/set"
+		self.thermostats = {name: Thermostat(name, settings) for name, settings in config["thermostats"].items()}
+		self.topics = {}
+		for thermostat in self.thermostats.values():
+			self.topics[thermostat.state_topic] = (thermostat, "state")
+			self.topics[thermostat.availability_topic] = (thermostat, "availability")
 		self.post = post
 		self.clock = clock
 		# Epoch-seeded so seq keeps rising across restarts without persisting anything
 		self.seq = int(clock())
-		# Reported on the next check-in, cleared only once a POST carrying it succeeds
-		self.pending_applied = None
-		# (version, result) of the last desired change acted on; a repeat of it is not re-applied
-		self.handled = None
-		# (version, device-unit setpoint, written_at) of a write the thermostat hasn't echoed back yet
-		self.unconfirmed = None
+		# thermostat name -> {"version", "result"}, reported on the next check-in and cleared only once a POST carrying it succeeds
+		self.pending_applied = {}
 
 		self.client = mqtt_client or mqtt.Client((config.get("client_id") or "smartsensor") + "-checkin")
 		self.client.on_connect = self.on_connect
@@ -212,26 +242,34 @@ class CheckinBridge:
 		except Exception:
 			logging.warning("Checkin: local MQTT shutdown failed", exc_info=True)
 
+	def invalidate_availability(self):
+		for thermostat in self.thermostats.values():
+			thermostat.state.invalidate_availability()
+
 	# Subscribing here (not once at init) restores the subscriptions after every reconnect
 	def on_connect(self, client, userdata, flags, rcode):
 		if rcode == 0:
-			client.subscribe([(self.state_topic, 0), (self.availability_topic, 0)])
+			client.subscribe([(topic, 0) for topic in self.topics])
 			logging.info("Checkin: local MQTT connected")
 		else:
-			self.thermostat.invalidate_availability()
+			self.invalidate_availability()
 			logging.warning("Checkin: local MQTT connect failed, rcode %s" % rcode)
 
 	# Fresh availability evidence has to arrive again after a reconnect
 	def on_disconnect(self, client, userdata, rcode):
-		self.thermostat.invalidate_availability()
+		self.invalidate_availability()
 		logging.warning("Checkin: local MQTT disconnected, rcode %s" % rcode)
 
 	def on_message(self, client, userdata, message):
 		try:
-			if message.topic == self.state_topic:
-				self.thermostat.on_state(message.payload, bool(message.retain), self.clock())
-			elif message.topic == self.availability_topic:
-				self.thermostat.on_availability(message.payload)
+			route = self.topics.get(message.topic)
+			if route is None:
+				return
+			thermostat, kind = route
+			if kind == "state":
+				thermostat.state.on_state(message.payload, bool(message.retain), self.clock())
+			else:
+				thermostat.state.on_availability(message.payload)
 		except Exception:
 			logging.warning("Checkin: bad thermostat message", exc_info=True)
 
@@ -251,100 +289,127 @@ class CheckinBridge:
 		dht22 = self.dht22_reading(now)
 		if dht22 is not None:
 			readings["dht22"] = dht22
-		thermostat = self.thermostat.snapshot()
-		if thermostat is not None:
-			readings["thermostat"] = thermostat
+		thermostats = {}
+		for name, thermostat in self.thermostats.items():
+			snapshot = thermostat.state.snapshot()
+			if snapshot is not None:
+				thermostats[name] = snapshot
+		if thermostats:
+			readings["thermostats"] = thermostats
 		body = {"device_id": self.device_id, "seq": self.seq, "ts": iso_utc(now), "readings": readings}
-		if self.pending_applied is not None:
-			body["applied"] = dict(self.pending_applied)
+		if self.pending_applied:
+			body["applied"] = {name: dict(entry) for name, entry in self.pending_applied.items()}
 		return body
 
-	# Hard bound on every write, independent of whatever HA believes the bounds are
-	def setpoint_in_bounds(self, setpoint):
-		return self.floor <= setpoint <= self.ceiling
-
-	# Round to the thermostat's step, nudged back inside the bounds if rounding crossed one
-	def device_setpoint(self, setpoint_f):
-		if self.thermostat.unit != "c":
-			return round(setpoint_f, 1)
-		value = round(f_to_c(setpoint_f) / SETPOINT_STEP_C) * SETPOINT_STEP_C
-		while c_to_f(value) < self.floor:
-			value += SETPOINT_STEP_C
-		while c_to_f(value) > self.ceiling:
-			value -= SETPOINT_STEP_C
-		return value
-
-	# Returns the device-unit target once the publish is handed to the local broker, else None. That is NOT
-	# the thermostat applying it: the message is QoS 0 and vanishes if zigbee2mqtt is down, so
-	# confirm_write() waits for the thermostat's own echo.
-	def write_setpoint(self, setpoint_f):
+	# Returns the {field: device-unit value} the publish carried once it is handed to the local broker, else
+	# None. That is NOT the thermostat applying it: the message is QoS 0 and vanishes if zigbee2mqtt is down,
+	# so confirm_write() waits for the thermostat's own echo.
+	def write(self, thermostat, fields):
 		try:
-			target = self.device_setpoint(setpoint_f)
-			if self.client.publish(self.set_topic, json.dumps({"occupied_heating_setpoint": target})).rc != 0:
+			if self.client.publish(thermostat.set_topic, json.dumps(fields)).rc != 0:
 				return None
-			return target
+			return fields
 		except Exception:
-			logging.warning("Checkin: setpoint publish failed", exc_info=True)
+			logging.warning("Checkin: thermostat publish failed", exc_info=True)
 			return None
 
-	# Turns a write awaiting its echo into a result: zigbee2mqtt publishing the new setpoint is the only proof
+	def report(self, name, version, result):
+		self.pending_applied[name] = {"version": version, "result": result}
+
+	# Turns a write awaiting its echo into a result: zigbee2mqtt publishing the new values is the only proof
 	def confirm_write(self, now):
-		if self.unconfirmed is None:
+		for name, thermostat in self.thermostats.items():
+			if thermostat.unconfirmed is None:
+				continue
+			version, expected, written_at = thermostat.unconfirmed
+			if self.echoed(thermostat, expected, written_at):
+				result = "applied"
+			elif now - written_at >= CONFIRM_TIMEOUT_SECONDS:
+				result = "failed"
+			else:
+				continue
+			thermostat.unconfirmed = None
+			# A failed write stays unhandled so a re-offer retries it
+			thermostat.handled = (version, result) if result != "failed" else None
+			self.report(name, version, result)
+			logging.info("Checkin: %s desired v%s %s" % (name, version, result))
+
+	def echoed(self, thermostat, expected, written_at):
+		for key, want in expected.items():
+			got = thermostat.state.field_since(key, written_at)
+			if key == "occupied_heating_setpoint":
+				got = number(got)
+				if got is None or not thermostat.same_setpoint(got, want):
+					return False
+			elif got != want:
+				return False
+		return True
+
+	# Returns the device-unit fields to write, or None when the request is outside what this thermostat allows
+	def validate(self, thermostat, desired):
+		fields = {}
+		if "setpoint_f" in desired:
+			setpoint = number(desired["setpoint_f"])
+			if setpoint is None or not thermostat.in_bounds(setpoint):
+				return None
+			fields["occupied_heating_setpoint"] = thermostat.device_setpoint(setpoint)
+		if "system_mode" in desired:
+			mode = desired["system_mode"]
+			if not isinstance(mode, str) or mode not in SYSTEM_MODES or mode not in thermostat.allowed_modes:
+				return None
+			fields["system_mode"] = mode
+		# Nothing to write is a malformed change, acknowledged so HA stops re-offering it
+		return fields or None
+
+	def apply_desired(self, thermostat, desired):
+		name = thermostat.name
+		version = desired.get("version") if isinstance(desired, dict) else None
+		if isinstance(version, bool) or not isinstance(version, int):
+			logging.warning("Checkin: %s desired has no integer version, ignoring" % name)
 			return
-		version, target, written_at = self.unconfirmed
-		echoed = self.thermostat.setpoint_since(written_at)
-		if echoed is not None and abs(echoed - target) < 0.01:
-			result = "applied"
-		elif now - written_at >= CONFIRM_TIMEOUT_SECONDS:
-			result = "failed"
-		else:
+		# Still waiting on the echo for this version: nothing to report yet, and never write twice
+		if thermostat.unconfirmed is not None and thermostat.unconfirmed[0] == version:
 			return
-		self.unconfirmed = None
-		# A failed write stays unhandled so a re-offer retries it
-		self.handled = (version, result) if result != "failed" else None
-		self.pending_applied = {"setpoint_version": version, "result": result}
-		logging.info("Checkin: desired setpoint v%s %s" % (version, result))
+		# HA keeps offering the same version until it sees our report; acting twice would also
+		# overwrite a manual change made at the thermostat in between. Re-offering means the
+		# earlier report was lost, so report again without writing.
+		if thermostat.handled is not None and thermostat.handled[0] == version:
+			self.report(name, version, thermostat.handled[1])
+			return
+
+		fields = self.validate(thermostat, desired)
+		if fields is None:
+			logging.warning("Checkin: %s desired v%s rejected (outside %s-%s F, modes %s, or malformed)" % (
+				name, version, thermostat.floor, thermostat.ceiling, "/".join(thermostat.allowed_modes)))
+			thermostat.handled = (version, "rejected_bounds")
+			self.report(name, version, "rejected_bounds")
+			return
+		# Unavailable means the QoS 0 write would vanish, so fail now instead of waiting out the timeout
+		written = self.write(thermostat, fields) if thermostat.state.is_available() else None
+		if written is None:
+			logging.warning("Checkin: %s desired v%s failed (thermostat unavailable or publish refused)" % (name, version))
+			thermostat.handled = None
+			thermostat.unconfirmed = None
+			self.report(name, version, "failed")
+			return
+		# A newer version replaces an earlier unconfirmed one: its echo can't be told apart from this one's
+		thermostat.unconfirmed = (version, written, self.clock())
+		self.pending_applied.pop(name, None)
 
 	def apply_reply(self, reply):
 		if not isinstance(reply, dict) or reply.get("ok") is not True:
 			logging.warning("Checkin: gateway reply not ok, ignoring")
 			return
 		desired = reply.get("desired")
-		# No desired change means the thermostat is never touched
-		if desired is None:
+		# No desired change means no thermostat is touched
+		if not isinstance(desired, dict):
 			return
-		version = desired.get("version") if isinstance(desired, dict) else None
-		if isinstance(version, bool) or not isinstance(version, int):
-			logging.warning("Checkin: desired has no integer version, ignoring")
-			return
-
-		# Still waiting on the echo for this version: nothing to report yet, and never write twice
-		if self.unconfirmed is not None and self.unconfirmed[0] == version:
-			return
-		# HA keeps offering the same version until it sees our report; acting twice would also
-		# overwrite a manual change made at the thermostat in between. Re-offering means the
-		# earlier report was lost, so report again without writing.
-		if self.handled is not None and self.handled[0] == version:
-			self.pending_applied = {"setpoint_version": version, "result": self.handled[1]}
-			return
-
-		setpoint = number(desired.get("setpoint_f"))
-		if setpoint is None or not self.setpoint_in_bounds(setpoint):
-			logging.warning("Checkin: desired setpoint v%s rejected (outside %s-%s F)" % (version, self.floor, self.ceiling))
-			self.handled = (version, "rejected_bounds")
-			self.pending_applied = {"setpoint_version": version, "result": "rejected_bounds"}
-			return
-		# Unavailable means the QoS 0 write would vanish, so fail now instead of waiting out the timeout
-		target = self.write_setpoint(setpoint) if self.thermostat.is_available() else None
-		if target is None:
-			logging.warning("Checkin: desired setpoint v%s failed (thermostat unavailable or publish refused)" % version)
-			self.handled = None
-			self.unconfirmed = None
-			self.pending_applied = {"setpoint_version": version, "result": "failed"}
-			return
-		# A newer version replaces an earlier unconfirmed one: its echo can't be told apart from this one's
-		self.unconfirmed = (version, target, self.clock())
-		self.pending_applied = None
+		for name, entry in desired.items():
+			thermostat = self.thermostats.get(name)
+			if thermostat is None:
+				logging.warning("Checkin: desired for unconfigured thermostat %r, ignoring" % name)
+				continue
+			self.apply_desired(thermostat, entry)
 
 	# One check-in. A failure just waits for the next tick; nothing is queued.
 	def tick(self):
@@ -359,5 +424,5 @@ class CheckinBridge:
 			return
 		# Only an ok reply proves HA received the report; anything else leaves it to be re-sent
 		if isinstance(reply, dict) and reply.get("ok") is True:
-			self.pending_applied = None
+			self.pending_applied = {}
 		self.apply_reply(reply)

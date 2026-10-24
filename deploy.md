@@ -47,6 +47,12 @@ Set `transport = checkin` (see the commented `[checkin]` block in `config.ini.ex
 thermostat through its own local zigbee2mqtt broker; `broker_host`/`client_id` are not needed and `device_id` must be set. Put the device token in
 `SMARTSENSOR_CHECKIN_TOKEN` (e.g. a root-only `EnvironmentFile=` in the unit) rather than `config.ini`. Default `transport` is `mqtt`, i.e. the behaviour above.
 
+Check-in contract v1.1: `thermostat_name` can list several thermostats (comma-separated), and per-thermostat setpoint bounds and allowed `system_mode`s
+go in `[thermostat:<name>]` sections; the Pi enforces them on the device (crawlspace: 45-65 °F, `heat` only).
+
+zigbee2mqtt needs `advanced.last_seen` enabled (e.g. `last_seen: ISO_8601` in its `configuration.yaml`; Gergy sets it on the Pi). Without it, retained
+thermostat state carries no `last_seen`, is ignored, and the thermostat is left out of the check-in until its next live report.
+
 ## Behaviour to rely on
 - A dead worker/child or unusable Manager makes the process exit 1, so `Restart=always` restarts it after `RestartSec`.
 - SIGTERM stops the children and exits 0 within a few seconds.

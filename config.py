@@ -33,6 +33,7 @@ KEYS = {
 	"thermostat_unit": False,
 	"setpoint_floor_f": False,
 	"setpoint_ceiling_f": False,
+	"thermostat_allowed_modes": False,
 }
 
 TRANSPORTS = ("mqtt", "checkin")
@@ -43,6 +44,11 @@ DEFAULT_THERMOSTAT_NAME = "crawlspace_thermostat"
 DEFAULT_THERMOSTAT_UNIT = "c"
 DEFAULT_SETPOINT_FLOOR_F = 45.0
 DEFAULT_SETPOINT_CEILING_F = 65.0
+# Heat-only unless a thermostat's section says otherwise: this Pi guards a crawlspace that must not be switched off
+DEFAULT_ALLOWED_MODES = "heat"
+SYSTEM_MODES = ("heat", "off", "cool", "auto")
+# Per-thermostat overrides live in [thermostat:<name>]; the sensor-section keys are the defaults
+THERMOSTAT_SECTION_PREFIX = "thermostat:"
 
 # The HA discovery identity is per-Pi: two Pis sharing these would overwrite each other's HA entities.
 # Defaults are the bedroom Pi's values so an unset key leaves its payloads unchanged.
@@ -59,17 +65,40 @@ class ConfigError(Exception):
 def default_config_path():
 	return os.environ.get(CONFIG_ENV) or os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.ini")
 
+# A thermostat's own section wins over the [sensor] defaults, which win over the built-ins
+def thermostat_settings(name, defaults, own):
+	def pick(key, fallback):
+		return own.get(key) or defaults.get(key) or fallback
+	try:
+		floor = float(pick("setpoint_floor_f", DEFAULT_SETPOINT_FLOOR_F))
+		ceiling = float(pick("setpoint_ceiling_f", DEFAULT_SETPOINT_CEILING_F))
+	except ValueError:
+		raise ConfigError("%s: setpoint_floor_f and setpoint_ceiling_f must be numbers" % name)
+	if not floor < ceiling:
+		raise ConfigError("%s: setpoint_floor_f (%s) must be below setpoint_ceiling_f (%s)" % (name, floor, ceiling))
+	unit = pick("thermostat_unit", DEFAULT_THERMOSTAT_UNIT).strip().lower()
+	if unit not in ("c", "f"):
+		raise ConfigError("%s: thermostat_unit must be c or f, got %r" % (name, unit))
+	modes = [m.strip().lower() for m in pick("thermostat_allowed_modes", DEFAULT_ALLOWED_MODES).split(",") if m.strip()]
+	if not modes or any(m not in SYSTEM_MODES for m in modes):
+		raise ConfigError("%s: thermostat_allowed_modes must be a list drawn from %s, got %r" % (name, "/".join(SYSTEM_MODES), modes))
+	return {"floor_f": floor, "ceiling_f": ceiling, "unit": unit, "allowed_modes": modes}
+
 # Env vars win over the file so a one-off override doesn't need a file edit.
 def load_config(path=None, environ=None):
 	environ = os.environ if environ is None else environ
 	path = path or default_config_path()
 
 	values = {}
+	overrides = {}
 	parser = configparser.ConfigParser()
 	if os.path.exists(path):
 		parser.read(path)
 		if parser.has_section(SECTION):
 			values.update(parser[SECTION])
+		for section in parser.sections():
+			if section.startswith(THERMOSTAT_SECTION_PREFIX):
+				overrides[section[len(THERMOSTAT_SECTION_PREFIX):].strip()] = dict(parser[section])
 
 	for key in KEYS:
 		env_value = environ.get("SMARTSENSOR_" + key.upper())
@@ -97,17 +126,8 @@ def load_config(path=None, environ=None):
 	except ValueError:
 		raise ConfigError("broker_port must be an integer, got %r" % values["broker_port"])
 
-	try:
-		floor = float(values.get("setpoint_floor_f") or DEFAULT_SETPOINT_FLOOR_F)
-		ceiling = float(values.get("setpoint_ceiling_f") or DEFAULT_SETPOINT_CEILING_F)
-	except ValueError:
-		raise ConfigError("setpoint_floor_f and setpoint_ceiling_f must be numbers")
-	if not floor < ceiling:
-		raise ConfigError("setpoint_floor_f (%s) must be below setpoint_ceiling_f (%s)" % (floor, ceiling))
-
-	unit = (values.get("thermostat_unit") or DEFAULT_THERMOSTAT_UNIT).strip().lower()
-	if unit not in ("c", "f"):
-		raise ConfigError("thermostat_unit must be c or f, got %r" % unit)
+	names = [n.strip() for n in (values.get("thermostat_name") or DEFAULT_THERMOSTAT_NAME).split(",") if n.strip()]
+	thermostats = {name: thermostat_settings(name, values, overrides.get(name, {})) for name in names}
 
 	if checkin:
 		url = values["checkin_url"].strip()
@@ -126,10 +146,7 @@ def load_config(path=None, environ=None):
 		"checkin_url": (values.get("checkin_url") or "").strip(),
 		"checkin_token": values.get("checkin_token") or "",
 		"local_mqtt_host": values.get("local_mqtt_host") or DEFAULT_LOCAL_MQTT_HOST,
-		"thermostat_name": values.get("thermostat_name") or DEFAULT_THERMOSTAT_NAME,
-		"thermostat_unit": unit,
-		"setpoint_floor_f": floor,
-		"setpoint_ceiling_f": ceiling,
+		"thermostats": thermostats,
 		"log_path": log_path,
 		# The FIFO sits beside the log because both need a directory the service user can write.
 		"fifo_path": values.get("fifo_path") or os.path.join(os.path.dirname(log_path), "temp.fifo"),
