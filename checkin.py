@@ -259,8 +259,10 @@ class CheckinBridge:
 			return
 
 		# HA keeps offering the same version until it sees our report; acting twice would also
-		# overwrite a manual change made at the thermostat in between.
+		# overwrite a manual change made at the thermostat in between. Re-offering means the
+		# earlier report was lost, so report again without writing.
 		if self.handled is not None and self.handled[0] == version:
+			self.pending_applied = {"setpoint_version": version, "result": self.handled[1]}
 			return
 
 		setpoint = number(desired.get("setpoint_f"))
@@ -284,6 +286,7 @@ class CheckinBridge:
 		except Exception as error:
 			logging.warning("Checkin: POST failed (%s: %s)" % (type(error).__name__, scrub(str(error), self.token)))
 			return
-		# The report went out, so it is not repeated
-		self.pending_applied = None
+		# Only an ok reply proves HA received the report; anything else leaves it to be re-sent
+		if isinstance(reply, dict) and reply.get("ok") is True:
+			self.pending_applied = None
 		self.apply_reply(reply)

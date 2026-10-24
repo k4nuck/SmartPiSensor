@@ -198,6 +198,26 @@ def test_same_version_not_reapplied_but_new_version_is():
 	bridge.apply_reply({"ok": True, "desired": {"setpoint_f": 55, "version": 8}})
 	assert len(published(client)) == 2
 
+def test_reoffered_version_is_reported_again_without_a_second_write():
+	bridge, client, _ = make()
+	reply = {"ok": True, "desired": {"setpoint_f": 50, "version": 7}}
+	bridge.apply_reply(reply)
+	bridge.pending_applied = None  # the report went out and was lost
+	bridge.apply_reply(reply)
+	assert bridge.pending_applied == {"setpoint_version": 7, "result": "applied"}
+	assert len(published(client)) == 1
+
+def test_lost_report_behind_not_ok_reply_is_resent_on_following_ticks():
+	bridge, client, _ = make(post=mock.Mock(return_value={"ok": True, "desired": {"setpoint_f": 50, "version": 7}}))
+	bridge.tick()
+	offer = {"ok": True, "desired": {"setpoint_f": 50, "version": 7}}
+	bridge.post = mock.Mock(side_effect=[{"ok": False}, offer, offer, {"ok": True}, {"ok": True}])
+	for _ in range(5):
+		bridge.tick()
+	reports = ["applied" in c[0][2] for c in bridge.post.call_args_list]
+	assert reports == [True, True, True, True, False]
+	assert len(published(client)) == 1
+
 def test_failed_publish_reports_failed_and_retries_same_version():
 	bridge, client, _ = make()
 	client.publish.return_value.rc = 4
