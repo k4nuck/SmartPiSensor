@@ -137,6 +137,11 @@ class ThermostatState:
 		with self._lock:
 			return self._available is True
 
+	# None (never heard) is not the same as offline: it is what zigbee2mqtt's disabled-by-default availability looks like
+	def availability_heard(self):
+		with self._lock:
+			return self._available is not None
+
 	# The field's value if a message carrying it arrived at or after `since`, else None
 	def field_since(self, key, since):
 		with self._lock:
@@ -192,6 +197,7 @@ class Thermostat:
 		self.handled = None
 		# (version, {field: device-unit value}, written_at) of a write the thermostat hasn't echoed back yet
 		self.unconfirmed = None
+		self.warned_no_availability = False
 
 	def in_bounds(self, setpoint_f):
 		return self.floor <= setpoint_f <= self.ceiling
@@ -386,6 +392,12 @@ class CheckinBridge:
 			return
 		# Unavailable means the QoS 0 write would vanish, so fail now instead of waiting out the timeout
 		written = self.write(thermostat, fields) if thermostat.state.is_available() else None
+		if written is None and not thermostat.state.availability_heard() and not thermostat.warned_no_availability:
+			# Once per thermostat so a re-offered change doesn't flood the log every tick
+			thermostat.warned_no_availability = True
+			logging.warning("Checkin: %s write refused because no message was ever heard on %s; enable availability in "
+				"zigbee2mqtt (1.x 'availability: true', 2.x 'availability: enabled: true'), it is off by default" % (
+				name, thermostat.availability_topic))
 		if written is None:
 			logging.warning("Checkin: %s desired v%s failed (thermostat unavailable or publish refused)" % (name, version))
 			thermostat.handled = None

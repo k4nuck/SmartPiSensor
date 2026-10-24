@@ -43,6 +43,9 @@ hum_unique_id = hum01ae
 # Set transport = checkin in [sensor]; broker_host and client_id are then not needed. Omitting transport keeps
 # the MQTT behaviour above. In this mode device_id is REQUIRED and is the gateway's device id (not the HA
 # discovery identity), and broker_port is the port of the Pi's local mosquitto.
+# zigbee2mqtt must have availability enabled (1.x 'availability: true', 2.x 'availability: enabled: true'; off by default;
+# Gergy enables it on the Pi) and advanced.last_seen. Without availability the thermostat always reports available:false
+# and no desired change is ever written.
 # Prefer the token as an env var (SMARTSENSOR_CHECKIN_TOKEN, e.g. in the unit's EnvironmentFile) over this file.
 #
 # [sensor]

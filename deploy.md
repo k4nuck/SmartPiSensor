@@ -53,6 +53,10 @@ go in `[thermostat:<name>]` sections; the Pi enforces them on the device (crawls
 zigbee2mqtt needs `advanced.last_seen` enabled (e.g. `last_seen: ISO_8601` in its `configuration.yaml`; Gergy sets it on the Pi). Without it, retained
 thermostat state carries no `last_seen`, is ignored, and the thermostat is left out of the check-in until its next live report.
 
+zigbee2mqtt also needs availability enabled (1.x `availability: true`, 2.x `availability: enabled: true`; off by default; Gergy enables it on the Pi). Without
+it nothing is published on `zigbee2mqtt/<name>/availability`, every check-in reports `available: false`, and every desired change is answered `failed`, so the
+thermostat is never written. The Pi logs a one-time warning when a write is refused for this reason.
+
 ## Behaviour to rely on
 - A dead worker/child or unusable Manager makes the process exit 1, so `Restart=always` restarts it after `RestartSec`.
 - SIGTERM stops the children and exits 0 within a few seconds.

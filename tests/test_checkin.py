@@ -610,3 +610,22 @@ def test_main_uses_bridge_not_mqtt_in_checkin_mode_and_closes_it(tmp_path, monke
 	mqtt_cls.assert_not_called()
 	bridge.tick.assert_called_once()
 	bridge.close.assert_called_once()
+
+# ---- availability never heard
+
+def test_write_refused_without_availability_warns_once(caplog):
+	bridge, client, _ = make()
+	with caplog.at_level("WARNING"):
+		bridge.apply_reply(desired(1, setpoint_f=50))
+		bridge.apply_reply(desired(2, setpoint_f=50))
+	assert client.publish.call_count == 0
+	assert bridge.pending_applied[NAME]["result"] == "failed"
+	assert len([r for r in caplog.records if "enable availability" in r.getMessage()]) == 1
+
+def test_write_refused_when_offline_does_not_warn_about_availability(caplog):
+	bridge, client, _ = make()
+	bridge.thermostats[NAME].state.on_availability(b"offline")
+	with caplog.at_level("WARNING"):
+		bridge.apply_reply(desired(1, setpoint_f=50))
+	assert client.publish.call_count == 0
+	assert not [r for r in caplog.records if "enable availability" in r.getMessage()]
