@@ -36,6 +36,14 @@ def state_msg(bridge, payload, topic=None, retain=False):
 	m = mock.Mock(topic=topic or bridge.state_topic, payload=json.dumps(payload).encode(), retain=retain)
 	bridge.on_message(None, None, m)
 
+def online(bridge):
+	bridge.thermostat.on_availability(b"online")
+
+# The thermostat echoing its new setpoint, as zigbee2mqtt does after a /set
+def echo(bridge, clock, setpoint_c, dt=1):
+	clock.t += dt
+	state_msg(bridge, {"occupied_heating_setpoint": setpoint_c})
+
 THERMO = {"local_temperature": 7.0, "occupied_heating_setpoint": 7.5, "system_mode": "heat",
 	"running_state": "heat", "pi_heating_demand": 40}
 
@@ -128,13 +136,34 @@ def test_retained_state_without_last_seen_is_not_used_as_a_reading():
 	state_msg(bridge, {**THERMO, "last_seen": "2026-10-24T01:00:00Z"}, retain=True)
 	assert bridge.build_body(NOW)["readings"]["thermostat"]["reading_at"] == "2026-10-24T01:00:00Z"
 
-def test_partial_state_messages_merge_and_refresh_reading_at():
+def test_partial_update_does_not_refresh_the_age_of_omitted_measurements():
+	bridge, _, clock = make()
+	state_msg(bridge, THERMO)
+	clock.t = NOW + 3600
+	state_msg(bridge, {"linkquality": 90})
+	t = bridge.build_body(clock.t)["readings"]["thermostat"]
+	assert t["local_temperature_f"] == 44.6 and t["setpoint_f"] == 45.5 and t["reading_at"] == checkin.iso_utc(NOW)
+
+def test_partial_update_merges_and_refreshes_only_what_it_carries():
 	bridge, _, clock = make()
 	state_msg(bridge, THERMO)
 	clock.t = NOW + 30
 	state_msg(bridge, {"local_temperature": 8.0})
-	t = bridge.build_body(NOW + 30)["readings"]["thermostat"]
+	t = bridge.build_body(clock.t)["readings"]["thermostat"]
 	assert t["local_temperature_f"] == 46.4 and t["setpoint_f"] == 45.5 and t["reading_at"] == checkin.iso_utc(NOW + 30)
+
+def test_fresh_setpoint_does_not_vouch_for_a_stale_temperature():
+	bridge, _, clock = make()
+	state_msg(bridge, THERMO)
+	clock.t = NOW + 600
+	state_msg(bridge, {"occupied_heating_setpoint": 8.0})
+	t = bridge.build_body(clock.t)["readings"]["thermostat"]
+	assert t["setpoint_f"] == 46.4 and t["reading_at"] == checkin.iso_utc(NOW)
+
+def test_state_with_no_measurement_fields_is_not_a_reading():
+	bridge, _, _ = make()
+	state_msg(bridge, {"linkquality": 90})
+	assert "thermostat" not in bridge.build_body(NOW)["readings"]
 
 # ---- units
 
@@ -146,6 +175,7 @@ def test_celsius_to_fahrenheit_and_back():
 
 def test_fahrenheit_thermostat_passes_through():
 	bridge, client, _ = make(thermostat_unit="f")
+	online(bridge)
 	state_msg(bridge, {"local_temperature": 44.6, "occupied_heating_setpoint": 50})
 	t = bridge.build_body(NOW)["readings"]["thermostat"]
 	assert (t["local_temperature_f"], t["setpoint_f"]) == (44.6, 50)
@@ -157,19 +187,71 @@ def test_fahrenheit_thermostat_passes_through():
 def published(client):
 	return [(c[0][0], json.loads(c[0][1])) for c in client.publish.call_args_list]
 
-def test_in_bounds_desired_publishes_celsius_and_reports_applied():
-	bridge, client, _ = make(post=mock.Mock(return_value={"ok": True, "desired": {"setpoint_f": 50, "version": 7}}))
+def test_in_bounds_desired_publishes_celsius_and_reports_applied_only_after_the_echo():
+	bridge, client, clock = make(post=mock.Mock(return_value={"ok": True, "desired": {"setpoint_f": 50, "version": 7}}))
+	online(bridge)
 	bridge.tick()
 	assert published(client) == [("zigbee2mqtt/crawlspace_thermostat/set", {"occupied_heating_setpoint": 10.0})]
+	assert bridge.pending_applied is None
 	bridge.post = mock.Mock(return_value={"ok": True})
+	bridge.tick()
+	assert "applied" not in bridge.post.call_args[0][2]
+	echo(bridge, clock, 10.0)
 	bridge.tick()
 	assert bridge.post.call_args[0][2]["applied"] == {"setpoint_version": 7, "result": "applied"}
 	bridge.tick()
 	assert "applied" not in bridge.post.call_args[0][2]
 
+def test_publish_alone_is_never_reported_applied_and_times_out_as_failed():
+	# mosquitto accepts the QoS 0 publish while zigbee2mqtt is stopped, so nothing echoes
+	bridge, client, clock = make()
+	online(bridge)
+	offer = {"ok": True, "desired": {"setpoint_f": 50, "version": 7}}
+	bridge.apply_reply(offer)
+	clock.t += checkin.CONFIRM_TIMEOUT_SECONDS - 1
+	bridge.confirm_write(clock())
+	assert bridge.pending_applied is None
+	clock.t += 1
+	bridge.confirm_write(clock())
+	assert bridge.pending_applied == {"setpoint_version": 7, "result": "failed"}
+	# not remembered as handled, so recovered zigbee2mqtt gets the write on the next offer
+	bridge.apply_reply(offer)
+	assert len(published(client)) == 2
+
+def test_echo_of_a_different_setpoint_does_not_confirm():
+	bridge, client, clock = make()
+	online(bridge)
+	bridge.apply_reply({"ok": True, "desired": {"setpoint_f": 50, "version": 7}})
+	echo(bridge, clock, 12.0)
+	bridge.confirm_write(clock())
+	assert bridge.pending_applied is None
+
+def test_setpoint_seen_before_the_write_does_not_confirm_it():
+	bridge, client, clock = make()
+	online(bridge)
+	state_msg(bridge, {"occupied_heating_setpoint": 10.0})
+	clock.t += 5
+	bridge.apply_reply({"ok": True, "desired": {"setpoint_f": 50, "version": 7}})
+	bridge.confirm_write(clock())
+	assert bridge.pending_applied is None
+
+def test_unavailable_thermostat_is_not_written_and_fails_immediately():
+	bridge, client, _ = make()
+	bridge.apply_reply({"ok": True, "desired": {"setpoint_f": 50, "version": 7}})
+	client.publish.assert_not_called()
+	assert bridge.pending_applied == {"setpoint_version": 7, "result": "failed"}
+
+def test_unconfirmed_version_reoffered_is_not_written_twice():
+	bridge, client, clock = make()
+	online(bridge)
+	offer = {"ok": True, "desired": {"setpoint_f": 50, "version": 7}}
+	bridge.apply_reply(offer); bridge.apply_reply(offer)
+	assert len(published(client)) == 1 and bridge.pending_applied is None
+
 def test_bounds_edges_are_accepted_and_rounding_never_leaves_them():
 	for f in (45, 65):
 		bridge, client, _ = make()
+		online(bridge)
 		bridge.apply_reply({"ok": True, "desired": {"setpoint_f": f, "version": 1}})
 		value = published(client)[0][1]["occupied_heating_setpoint"]
 		assert 45 <= c_to_f(value) <= 65, value
@@ -191,25 +273,30 @@ def test_no_desired_never_touches_thermostat():
 		assert bridge.pending_applied is None
 
 def test_same_version_not_reapplied_but_new_version_is():
-	bridge, client, _ = make()
+	bridge, client, clock = make()
+	online(bridge)
 	reply = {"ok": True, "desired": {"setpoint_f": 50, "version": 7}}
-	bridge.apply_reply(reply); bridge.apply_reply(reply)
+	bridge.apply_reply(reply); echo(bridge, clock, 10.0); bridge.confirm_write(clock())
+	bridge.apply_reply(reply)
 	assert len(published(client)) == 1
 	bridge.apply_reply({"ok": True, "desired": {"setpoint_f": 55, "version": 8}})
 	assert len(published(client)) == 2
 
 def test_reoffered_version_is_reported_again_without_a_second_write():
-	bridge, client, _ = make()
+	bridge, client, clock = make()
+	online(bridge)
 	reply = {"ok": True, "desired": {"setpoint_f": 50, "version": 7}}
-	bridge.apply_reply(reply)
+	bridge.apply_reply(reply); echo(bridge, clock, 10.0); bridge.confirm_write(clock())
 	bridge.pending_applied = None  # the report went out and was lost
 	bridge.apply_reply(reply)
 	assert bridge.pending_applied == {"setpoint_version": 7, "result": "applied"}
 	assert len(published(client)) == 1
 
 def test_lost_report_behind_not_ok_reply_is_resent_on_following_ticks():
-	bridge, client, _ = make(post=mock.Mock(return_value={"ok": True, "desired": {"setpoint_f": 50, "version": 7}}))
+	bridge, client, clock = make(post=mock.Mock(return_value={"ok": True, "desired": {"setpoint_f": 50, "version": 7}}))
+	online(bridge)
 	bridge.tick()
+	echo(bridge, clock, 10.0)
 	offer = {"ok": True, "desired": {"setpoint_f": 50, "version": 7}}
 	bridge.post = mock.Mock(side_effect=[{"ok": False}, offer, offer, {"ok": True}, {"ok": True}])
 	for _ in range(5):
@@ -219,17 +306,20 @@ def test_lost_report_behind_not_ok_reply_is_resent_on_following_ticks():
 	assert len(published(client)) == 1
 
 def test_failed_publish_reports_failed_and_retries_same_version():
-	bridge, client, _ = make()
+	bridge, client, clock = make()
+	online(bridge)
 	client.publish.return_value.rc = 4
 	reply = {"ok": True, "desired": {"setpoint_f": 50, "version": 7}}
 	bridge.apply_reply(reply)
 	assert bridge.pending_applied == {"setpoint_version": 7, "result": "failed"}
 	client.publish.return_value.rc = 0
 	bridge.apply_reply(reply)
+	echo(bridge, clock, 10.0); bridge.confirm_write(clock())
 	assert bridge.pending_applied == {"setpoint_version": 7, "result": "applied"}
 
 def test_publish_exception_is_failed_not_crash():
 	bridge, client, _ = make()
+	online(bridge)
 	client.publish.side_effect = OSError("broker gone")
 	bridge.apply_reply({"ok": True, "desired": {"setpoint_f": 50, "version": 7}})
 	assert bridge.pending_applied["result"] == "failed"
@@ -237,8 +327,10 @@ def test_publish_exception_is_failed_not_crash():
 # ---- failure paths and secrets
 
 def test_post_failure_keeps_pending_applied_and_does_not_queue():
-	bridge, _, _ = make(post=mock.Mock(return_value={"ok": True, "desired": {"setpoint_f": 50, "version": 7}}))
+	bridge, _, clock = make(post=mock.Mock(return_value={"ok": True, "desired": {"setpoint_f": 50, "version": 7}}))
+	online(bridge)
 	bridge.tick()
+	echo(bridge, clock, 10.0)
 	bridge.post = mock.Mock(side_effect=OSError("timed out"))
 	bridge.tick()
 	assert bridge.post.call_count == 1
@@ -283,6 +375,28 @@ def test_http_post_rejects_non_200_and_oversize(monkeypatch):
 	monkeypatch.setattr(checkin._opener, "open", lambda r, timeout: Resp(200, b" " * (checkin.MAX_REPLY_BYTES + 5)))
 	with pytest.raises(checkin.CheckinError):
 		checkin.http_post("https://h/x", TOKEN, {})
+
+def test_disconnect_invalidates_availability_until_fresh_evidence():
+	bridge, client, _ = make()
+	state_msg(bridge, THERMO)
+	online(bridge)
+	assert bridge.build_body(NOW)["readings"]["thermostat"]["available"] is True
+	bridge.on_disconnect(client, None, 1)
+	assert bridge.build_body(NOW)["readings"]["thermostat"]["available"] is False
+	bridge.apply_reply({"ok": True, "desired": {"setpoint_f": 50, "version": 7}})
+	client.publish.assert_not_called()
+	online(bridge)  # availability replayed by the broker after reconnecting
+	assert bridge.build_body(NOW)["readings"]["thermostat"]["available"] is True
+
+def test_failed_reconnect_attempt_also_clears_availability():
+	bridge, client, _ = make()
+	state_msg(bridge, THERMO); online(bridge)
+	bridge.on_connect(client, None, {}, 5)
+	assert bridge.build_body(NOW)["readings"]["thermostat"]["available"] is False
+
+def test_bridge_registers_disconnect_callback():
+	bridge, client, _ = make()
+	assert client.on_disconnect == bridge.on_disconnect
 
 def test_on_connect_subscribes_both_topics():
 	bridge, client, _ = make()
