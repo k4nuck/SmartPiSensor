@@ -42,6 +42,11 @@ WantedBy=multi-user.target
 
 On the crawlspace Pi the existing `wait-for-broker.conf` drop-in can stay; the program now also retries the broker connection itself.
 
+## Check-in mode (no Tailscale)
+Set `transport = checkin` (see the commented `[checkin]` block in `config.ini.example`). The Pi then POSTs to gergy-edge every 60 s and reads/writes the
+thermostat through its own local zigbee2mqtt broker; `broker_host`/`client_id` are not needed and `device_id` must be set. Put the device token in
+`SMARTSENSOR_CHECKIN_TOKEN` (e.g. a root-only `EnvironmentFile=` in the unit) rather than `config.ini`. Default `transport` is `mqtt`, i.e. the behaviour above.
+
 ## Behaviour to rely on
 - A dead worker/child or unusable Manager makes the process exit 1, so `Restart=always` restarts it after `RestartSec`.
 - SIGTERM stops the children and exits 0 within a few seconds.

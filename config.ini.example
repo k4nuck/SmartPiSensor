@@ -38,3 +38,22 @@ hum_unique_id = hum01ae
 #   device_name    = Crawlspace
 #   temp_unique_id = tempCrawl01
 #   hum_unique_id  = humCrawl01
+
+# Check-in mode (no Tailscale): report to gergy-edge over HTTPS and bridge a local zigbee2mqtt thermostat.
+# Set transport = checkin in [sensor]; broker_host and client_id are then not needed. Omitting transport keeps
+# the MQTT behaviour above. In this mode device_id is REQUIRED and is the gateway's device id (not the HA
+# discovery identity), and broker_port is the port of the Pi's local mosquitto.
+# Prefer the token as an env var (SMARTSENSOR_CHECKIN_TOKEN, e.g. in the unit's EnvironmentFile) over this file.
+#
+# [sensor]
+# sensor_name = sensorCrawlspace
+# log_path = /home/k4nuck/projects/dht22/dht22.log
+# transport = checkin
+# checkin_url = https://gergy-edge.hopto.org/devices/checkin
+# checkin_token = <device token>
+# device_id = crawlspace
+# local_mqtt_host = 127.0.0.1
+# thermostat_name = crawlspace_thermostat
+# thermostat_unit = c
+# setpoint_floor_f = 45
+# setpoint_ceiling_f = 65

@@ -50,6 +50,8 @@ class SmartSensor:
 			self.manager = SyncManager()
 			self.manager.start(_manager_init)
 			self.sensor_data = self.manager.dict({"temperature_f":0.0, "temperature_c":0.0, "humidity":0.0})
+			# Kept apart from sensor_data so the dict that mqtt mode logs and publishes is unchanged
+			self.read_meta = self.manager.dict({"read_at": 0.0})
 
 			# Kick off worker and timer thread
 			self.worker_thread = multiprocessing.Process(target=self.worker)
@@ -135,6 +137,7 @@ class SmartSensor:
 				self.sensor_data["temperature_f"] = round(temperature_f,1)
 				self.sensor_data["temperature_c"] = round(temperature_c,1)
 				self.sensor_data["humidity"] = round(humidity,0)
+				self.read_meta["read_at"] = time.time()
 
 				logging.debug("SmartSensor:After:get_temp_from_sensor:"+str(self.sensor_data))
 
@@ -184,6 +187,10 @@ class SmartSensor:
 	# Get Sensor Data
 	def get_sensor_data(self):
 		return self.sensor_data
+
+	# Epoch seconds of the last successful hardware read; 0.0 if none yet
+	def get_last_read_at(self):
+		return self.read_meta["read_at"]
 
 	# Returns sensor type
 	def get_sensor_type(self):

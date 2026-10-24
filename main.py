@@ -17,6 +17,7 @@ from logging.handlers import RotatingFileHandler
 from config import load_config
 from smartsensor import *
 from smartsensorToMQTT import *
+from checkin import CheckinBridge
 from procutil import stop_processes
 
 # Process for sending commands to the server from command line
@@ -87,6 +88,7 @@ def main(config_path=None):
 	signal.signal(signal.SIGTERM, handle_sigterm)
 
 	sensor = None
+	bridge = None
 	children = {}
 	try:
 		# Create Sensor
@@ -98,10 +100,14 @@ def main(config_path=None):
 			if failure:
 				raise SupervisionFailure(failure)
 
-		# Create SmartSensorToMQTT
-		sensor_to_MQTT_prod = SmartSensorToMQTT(config["client_id"],config["broker_host"],config["broker_port"],"homeassistant",sensor,
-			device_id=config["device_id"],device_name=config["device_name"],
-			temp_unique_id=config["temp_unique_id"],hum_unique_id=config["hum_unique_id"],supervise=supervise)
+		if config["transport"] == "checkin":
+			# Reports over HTTPS and reads the thermostat from the Pi's own zigbee2mqtt broker
+			bridge = CheckinBridge(config, sensor)
+		else:
+			# Create SmartSensorToMQTT
+			sensor_to_MQTT_prod = SmartSensorToMQTT(config["client_id"],config["broker_host"],config["broker_port"],"homeassistant",sensor,
+				device_id=config["device_id"],device_name=config["device_name"],
+				temp_unique_id=config["temp_unique_id"],hum_unique_id=config["hum_unique_id"],supervise=supervise)
 
 		# Create queue
 		mainLoopQueue = multiprocessing.Queue()
@@ -134,7 +140,10 @@ def main(config_path=None):
 				logging.info("Main Loop:Sensor Data:"+str(sensor.get_sensor_data()))
 				
 				# Send sensor data to pipe
-				sensor_to_MQTT_prod.refresh()
+				if bridge is not None:
+					bridge.tick()
+				else:
+					sensor_to_MQTT_prod.refresh()
 
 			# Handle Exit
 			if obj["cmd"]=="exit":
@@ -152,6 +161,8 @@ def main(config_path=None):
 		return 1
 	finally:
 		stop_processes(list(children.values()))
+		if bridge is not None:
+			bridge.close()
 		if sensor is not None:
 			try:
 				sensor.shutdown()
