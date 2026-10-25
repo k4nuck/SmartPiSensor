@@ -6,3 +6,7 @@ Pipfile*
 *.fifo
 *pycache*
 config.ini
+# HomeKit pairing keys can control the thermostat; a Pi-checkout snapshot commit must never publish them.
+ecobee/
+ecobee-pairing-*.recovery.json
+fake_thermostat.state

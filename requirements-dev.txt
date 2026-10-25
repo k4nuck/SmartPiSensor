@@ -1,0 +1,4 @@
+# Bench-test only: tools/fake_homekit_thermostat.py on the home LAN. Never install on the crawlspace Pi.
+-r requirements-ecobee.txt
+HAP-python>=5,<6
+pytest
