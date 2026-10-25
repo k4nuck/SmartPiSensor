@@ -12,13 +12,14 @@ import json
 import logging
 import signal
 import sys
+import threading
 import time
 
 import paho.mqtt.client as mqtt
 
 from config import load_config, ConfigError
 from ecobee_hk import open_controller
-from ecobee_state import discover_layout, read_ids, build_state
+from ecobee_state import discover_layout, read_ids, build_state, thermostat_answered
 from ecobee_store import pairings_path, load_pairings
 
 TOPIC_ROOT = "upstate/ecobee"
@@ -27,6 +28,11 @@ POLL_INTERVAL_SECONDS = 60
 READ_TIMEOUT_SECONDS = 20
 # One missed poll is routine on Wi-Fi; two in a row means the thermostat is really gone.
 OFFLINE_AFTER_FAILURES = 2
+# aiohomekit replaces pairing.accessories when the ecobee advertises a new configuration, but a characteristic
+# that vanished only shows up as a HAP status, so also re-learn the tree now and then.
+LAYOUT_REFRESH_SECONDS = 600
+# systemd gives us 15 s (TimeoutStopSec) to stop; the offline publication must land inside it even if a read hangs.
+CLOSE_PUBLISH_WAIT_SECONDS = 3
 
 def state_topic(device_id):
 	return "%s/%s/state" % (TOPIC_ROOT, device_id)
@@ -54,13 +60,22 @@ class ReadOnlyPairing:
 		await self._pairing.close()
 
 # One MQTT connection per thermostat: an LWT is per-connection, and each thermostat needs its own availability topic.
+# Only the latest state and availability are kept: while the broker is unreachable nothing is handed to paho (its
+# queue is unbounded and would replay hours of stale retained states), and on connect the newest of each is sent once.
 class MqttPublisher:
 	def __init__(self, client_id, host, port, device_id):
 		self.device_id = device_id
-		self._online = False
+		self._lock = threading.Lock()
+		self._connected = False
+		self._latest_state = None
+		self._latest_online = None
 		self.client = mqtt.Client(client_id)
 		self.client.will_set(availability_topic(device_id), "offline", qos=1, retain=True)
 		self.client.on_connect = self._on_connect
+		self.client.on_disconnect = self._on_disconnect
+		# Backstop for messages caught in flight by a drop; the latest-value policy above is what keeps the backlog small.
+		self.client.max_queued_messages_set(4)
+		self.client.max_inflight_messages_set(4)
 		# connect_async + loop_start retries on its own, so a broker/DNS outage at boot doesn't kill the service.
 		self.client.reconnect_delay_set(min_delay=1, max_delay=60)
 		self.client.connect_async(host, port)
@@ -71,47 +86,101 @@ class MqttPublisher:
 			logging.warning("EcobeeMQTT:%s:connect refused rcode=%s", self.device_id, rcode)
 			return
 		# The broker drops our retained "online" only via the LWT, so re-assert after every reconnect.
-		if self._online:
-			self.publish_availability(True)
+		with self._lock:
+			self._connected = True
+			if self._latest_state is not None:
+				self._send(state_topic(self.device_id), self._latest_state)
+			if self._latest_online is not None:
+				self._send(availability_topic(self.device_id), "online" if self._latest_online else "offline")
+
+	def _on_disconnect(self, client, userdata, rcode):
+		with self._lock:
+			self._connected = False
+
+	def _send(self, topic, payload):
+		info = self.client.publish(topic, payload, qos=1, retain=True)
+		if info.rc != mqtt.MQTT_ERR_SUCCESS:
+			logging.warning("EcobeeMQTT:%s:publish to %s returned rc=%s", self.device_id, topic, info.rc)
+		return info
 
 	def publish_state(self, state):
-		self.client.publish(state_topic(self.device_id), json.dumps(state), qos=1, retain=True)
+		payload = json.dumps(state)
+		with self._lock:
+			self._latest_state = payload
+			if self._connected:
+				self._send(state_topic(self.device_id), payload)
 
 	def publish_availability(self, online):
-		self._online = online
-		self.client.publish(availability_topic(self.device_id), "online" if online else "offline", qos=1, retain=True)
+		with self._lock:
+			self._latest_online = online
+			if self._connected:
+				self._send(availability_topic(self.device_id), "online" if online else "offline")
 
-	def close(self):
-		info = self.client.publish(availability_topic(self.device_id), "offline", qos=1, retain=True)
-		try:
-			info.wait_for_publish(timeout=3)
-		except (ValueError, RuntimeError):
-			pass
+	# Publish "offline" and return the in-flight handle (None if the broker is unreachable, where the LWT/retained
+	# offline already covers it); finish_close() waits on the handles under one shared deadline.
+	def begin_close(self):
+		with self._lock:
+			self._latest_online = False
+			if not self._connected:
+				return None
+			return self._send(availability_topic(self.device_id), "offline")
+
+	def finish_close(self):
 		self.client.disconnect()
 		self.client.loop_stop()
 
+def close_publishers(publishers, wait=CLOSE_PUBLISH_WAIT_SECONDS):
+	pending = [(p, p.begin_close()) for p in publishers]
+	deadline = time.monotonic() + wait
+	for _, info in pending:
+		if info is None:
+			continue
+		try:
+			info.wait_for_publish(timeout=max(0.0, deadline - time.monotonic()))
+		except (ValueError, RuntimeError):
+			pass
+	for publisher, _ in pending:
+		publisher.finish_close()
+
 class Poller:
-	def __init__(self, device_id, name, pairing, publisher, clock=time.time):
+	def __init__(self, device_id, name, pairing, publisher, clock=time.time, monotonic=time.monotonic):
 		self.device_id = device_id
 		self.name = name
 		self.pairing = pairing
 		self.publisher = publisher
 		self.clock = clock
+		self.monotonic = monotonic
 		self.layout = None
+		self._layout_source = None
+		self._layout_at = 0
 		self.failures = 0
 
+	def _layout_stale(self):
+		return (self.layout is None
+			or self.pairing.accessories is not self._layout_source
+			or self.monotonic() - self._layout_at >= LAYOUT_REFRESH_SECONDS)
+
 	async def _ensure_layout(self):
-		if self.layout is None:
+		if self._layout_stale():
 			await self.pairing.list_accessories_and_characteristics()
-			self.layout = discover_layout(self.pairing.accessories)
-			if not self.layout["thermostat"]:
+			layout = discover_layout(self.pairing.accessories)
+			if not layout["thermostat"]:
 				self.layout = None
 				raise RuntimeError("no thermostat service on this accessory")
+			self.layout = layout
+			self._layout_source = self.pairing.accessories
+			self._layout_at = self.monotonic()
+
+	async def _read(self):
+		await self._ensure_layout()
+		values = await self.pairing.get_characteristics(read_ids(self.layout))
+		if not thermostat_answered(self.layout, values):
+			raise RuntimeError("every thermostat characteristic read returned a HAP error: %r" % (list(values.values())[:1],))
+		return values
 
 	async def poll_once(self):
 		try:
-			await asyncio.wait_for(self._ensure_layout(), READ_TIMEOUT_SECONDS)
-			values = await asyncio.wait_for(self.pairing.get_characteristics(read_ids(self.layout)), READ_TIMEOUT_SECONDS)
+			values = await asyncio.wait_for(self._read(), READ_TIMEOUT_SECONDS)
 		except Exception as error:
 			self.failures += 1
 			# Re-learn the accessory tree on the next try: the ecobee may have gained/lost a room sensor.
@@ -126,9 +195,18 @@ class Poller:
 		self.publisher.publish_availability(True)
 		return True
 
+	# A poll is cancelled the moment stop is set: a wedged HomeKit read must not eat the stop deadline.
 	async def run(self, stop, interval=POLL_INTERVAL_SECONDS):
 		while not stop.is_set():
-			await self.poll_once()
+			poll = asyncio.ensure_future(self.poll_once())
+			stopped = asyncio.ensure_future(stop.wait())
+			try:
+				await asyncio.wait({poll, stopped}, return_when=asyncio.FIRST_COMPLETED)
+			finally:
+				stopped.cancel()
+				if not poll.done():
+					poll.cancel()
+					await asyncio.gather(poll, return_exceptions=True)
 			try:
 				await asyncio.wait_for(stop.wait(), interval)
 			except asyncio.TimeoutError:
@@ -143,8 +221,8 @@ async def run_service(cfg, stop):
 		raise ConfigError("No paired ecobees in %s; run ecobee_pair.py <name> <setup-code> first" % pairings_path(cfg))
 
 	publishers = []
-	try:
-		async with open_controller() as controller:
+	async with open_controller() as controller:
+		try:
 			tasks = []
 			for alias, data in pairings.items():
 				pairing = ReadOnlyPairing(controller.load_pairing(alias, data))
@@ -152,9 +230,9 @@ async def run_service(cfg, stop):
 				publishers.append(publisher)
 				tasks.append(asyncio.create_task(Poller(alias, _device_name(alias), pairing, publisher).run(stop)))
 			await asyncio.gather(*tasks)
-	finally:
-		for publisher in publishers:
-			publisher.close()
+		finally:
+			# Offline first: it is the promise to HA, and controller teardown below can be slow.
+			close_publishers(publishers)
 
 async def _main():
 	stop = asyncio.Event()

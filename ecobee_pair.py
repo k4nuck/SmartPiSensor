@@ -10,12 +10,15 @@
 
 import argparse
 import asyncio
+import json
 import logging
+import os
 import sys
+import tempfile
 
 from config import load_config, ConfigError
 from ecobee_hk import open_controller
-from ecobee_store import pairings_path, load_pairings, save_pairings, slug
+from ecobee_store import pairings_path, load_pairings, save_pairings, prepare_storage, write_recovery, slug
 
 DISCOVER_SECONDS = 8
 THERMOSTAT_CATEGORY = 9
@@ -49,7 +52,11 @@ async def pair(cfg, name, code, device_id=None):
 	alias = slug(name)
 	code = _normalize_code(code)
 	path = pairings_path(cfg)
-	pairings = load_pairings(path)
+	try:
+		prepare_storage(path)
+		pairings = load_pairings(path)
+	except OSError as error:
+		raise PairError("cannot store keys in %s (%r); nothing was paired, fix that and retry" % (os.path.dirname(path), error))
 	if alias in pairings:
 		raise PairError("%r is already paired (keys in %s); remove its entry first to re-pair" % (alias, path))
 
@@ -63,8 +70,19 @@ async def pair(cfg, name, code, device_id=None):
 		except Exception as error:
 			raise PairError("pairing with %s failed (wrong setup code?): %r" % (discovery.description.id, error))
 		pairings[alias] = pairing.pairing_data
-		save_pairings(path, pairings)
+		try:
+			save_pairings(path, pairings)
+		except OSError as error:
+			raise _unsaved(alias, pairing.pairing_data, path, error)
 		return alias, discovery.description.id
+
+# The thermostat is already paired to us, so losing these keys means a physical reset. Never drop them silently.
+def _unsaved(alias, pairing_data, path, error):
+	recovery = write_recovery(alias, pairing_data, [os.path.dirname(path), os.path.expanduser("~"), tempfile.gettempdir()])
+	if recovery:
+		return PairError("PAIRED, but saving to %s failed (%r). The keys are in %s (mode 600): move it into place or merge it into pairings.json" % (path, error, recovery))
+	# Stderr is the only channel left; the operator must copy this now, it is the only copy.
+	return PairError("PAIRED, but saving failed (%r) and no recovery file could be written. THIS IS THE ONLY COPY of the keys, copy it now:\n%s" % (error, json.dumps({alias: pairing_data})))
 
 def main(argv=None):
 	parser = argparse.ArgumentParser(description="Pair this Pi as a HomeKit controller of an ecobee (read-only use).")

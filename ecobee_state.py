@@ -64,13 +64,17 @@ def c_to_f(celsius):
 	return None if celsius is None else round(celsius * 9 / 5 + 32, 1)
 
 # values: {(aid, iid): {"value": x}} as get_characteristics returns; an entry with "status" (HAP error) reads as None.
+def _readable(values, ident):
+	entry = values.get(ident) if ident is not None else None
+	return bool(entry) and "status" not in entry and "value" in entry
+
 def _val(values, ident):
-	if ident is None:
-		return None
-	entry = values.get(ident)
-	if not entry or "status" in entry:
-		return None
-	return entry.get("value")
+	return values[ident]["value"] if _readable(values, ident) else None
+
+# aiohomekit reports HAP errors as per-characteristic statuses (a global error is expanded across every id) rather than
+# raising, so "the read returned" does not mean "the thermostat answered".
+def thermostat_answered(layout, values):
+	return any(_readable(values, ident) for ident in layout["thermostat"].values())
 
 def build_state(name, layout, values, ts):
 	t = layout["thermostat"]
@@ -78,13 +82,15 @@ def build_state(name, layout, values, ts):
 
 	mode = HVAC_MODES.get(get("mode"))
 	target = c_to_f(get("target"))
-	# Auto mode reports heat/cool thresholds; single-setpoint modes report only the one target.
-	target_heat = c_to_f(get("heat_threshold"))
-	target_cool = c_to_f(get("cool_threshold"))
-	if target_heat is None and mode == "heat":
-		target_heat = target
-	if target_cool is None and mode == "cool":
-		target_cool = target
+	# Pick the active setpoint by mode: the threshold characteristics can linger on the accessory after the mode
+	# leaves auto, so their mere presence says nothing about which setpoint is live.
+	if mode == "heat":
+		target_heat, target_cool = target, None
+	elif mode == "cool":
+		target_heat, target_cool = None, target
+	else:
+		target_heat = c_to_f(get("heat_threshold"))
+		target_cool = c_to_f(get("cool_threshold"))
 
 	occupancy_of = lambda ident: None if ident is None or _val(values, ident) is None else bool(_val(values, ident))
 	return {

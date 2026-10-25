@@ -5,7 +5,18 @@
 #
 # Shared aiohomekit controller setup for the pairing CLI and the service.
 
+import asyncio
+import logging
 from contextlib import asynccontextmanager
+
+# Each teardown step is bounded so a stuck socket can't carry the service past systemd's stop deadline.
+TEARDOWN_STEP_SECONDS = 2
+
+async def _bounded(step, awaitable):
+	try:
+		await asyncio.wait_for(awaitable, TEARDOWN_STEP_SECONDS)
+	except Exception as error:
+		logging.warning("Ecobee:teardown %s did not finish cleanly: %r", step, error)
 
 @asynccontextmanager
 async def open_controller():
@@ -23,6 +34,6 @@ async def open_controller():
 		await controller.async_start()
 		yield controller
 	finally:
-		await controller.async_stop()
-		await browser.async_cancel()
-		await azc.async_close()
+		await _bounded("controller", controller.async_stop())
+		await _bounded("browser", browser.async_cancel())
+		await _bounded("zeroconf", azc.async_close())

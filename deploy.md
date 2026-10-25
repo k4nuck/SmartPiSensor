@@ -97,6 +97,8 @@ Put the ecobee in HomeKit setup (its screen shows the code), then:
 
 Repeat for the Backroom (`backroom`). The tool picks the one unpaired thermostat it can see; if it sees several it refuses and asks for `--device-id`.
 A wrong code prints `ecobee-pair FAILED: ... wrong setup code?` and exits 1, storing nothing. Then `sudo systemctl enable --now ecobee-reader` (or `restart`).
+The tool checks the key directory is writable *before* pairing. If saving still fails afterwards it says `PAIRED, but saving ... failed` and leaves the keys in a mode-600 `ecobee-pairing-<name>.recovery.json` (or prints them as a last resort): merge that into `pairings.json`, do not re-pair.
+On stop the service cancels any in-flight read, publishes `offline` and disconnects, well inside `TimeoutStopSec=15`. While the broker is unreachable only the latest state is kept and sent on reconnect.
 An ecobee can only be paired once without resetting it; the keys in `ecobee/pairings.json` are the only copy, so back that file up.
 
 ## Bench test at home (fake thermostat)
