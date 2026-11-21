@@ -30,7 +30,7 @@ class FakeAdb:
 		self.pending = None
 		self.flip_after_reads = flip_after_reads
 
-	async def route_uses_exit_node(self):
+	async def route_uses_exit_node(self, deadline=None):
 		if self.fail_reads:
 			raise AdbError("offline")
 		if self.pending is not None:
@@ -40,7 +40,7 @@ class FakeAdb:
 				self.pending = (self.pending[0], self.pending[1] - 1)
 		return self.route
 
-	async def broadcast(self, node):
+	async def broadcast(self, node, deadline=None):
 		if self.fail_broadcast:
 			raise AdbError(self.fail_broadcast)
 		self.broadcasts.append(node)
@@ -248,3 +248,132 @@ def test_publisher_sets_retained_lwt():
 		shield_service.MqttPublisher("cid", "broker", 1883, "upstate_tv")
 	client_cls.return_value.will_set.assert_called_once_with("upstate/shield/upstate_tv/availability", "offline", qos=1, retain=True)
 	client_cls.return_value.connect_async.assert_called_once_with("broker", 1883)
+
+# -- rework of review findings --
+
+class BoundedPublisher(FakePublisher):
+	"""Client queue of fixed size that only drains when the test says so, like unacknowledged qos1 publishes."""
+	def __init__(self, size=4, queued=0):
+		super().__init__()
+		self.size, self.queued, self.order = size, queued, []
+	def _take(self, kind):
+		if self.queued >= self.size:
+			return False
+		self.queued += 1
+		self.order.append(kind)
+		return True
+	def publish_state(self, state): return self._take("state")
+	def publish_availability(self, online): return self._take("availability")
+	def publish_result(self, result):
+		ok = self._take("result")
+		if ok:
+			self.results.append(result)
+		return ok
+
+def test_result_is_published_before_state_when_queue_is_nearly_full():
+	pub = BoundedPublisher(size=4, queued=2)
+	shield = Shield(FakeAdb(), pub, clock=lambda: NOW, verify_seconds=0.2, verify_poll=0.01)
+	run(shield.handle(cmd("turn_on")))
+	assert pub.order[0] == "result"
+	assert [r["outcome"] for r in pub.results] == ["ok"]
+
+def test_result_publish_is_retried_when_queue_is_full(monkeypatch):
+	monkeypatch.setattr(shield_service, "RESULT_RETRY_SECONDS", 0.01)
+	pub = BoundedPublisher(size=1, queued=1)
+	shield = Shield(FakeAdb(), pub, clock=lambda: NOW, verify_seconds=0.2, verify_poll=0.01)
+	async def go():
+		task = asyncio.create_task(shield.handle(cmd("turn_on")))
+		await asyncio.sleep(0.05)
+		pub.queued = 0
+		await task
+	run(go())
+	assert [r["outcome"] for r in pub.results] == ["ok"]
+
+def test_refused_state_publish_is_retried_by_next_poll():
+	pub = BoundedPublisher(size=0)
+	shield = Shield(FakeAdb(), pub, clock=lambda: NOW)
+	run(shield.poll_once())
+	pub.size = 10
+	run(shield.poll_once())
+	assert pub.order.count("state") == 1
+
+def test_broadcast_error_publishes_unknown_state_and_reachable_availability():
+	adb = FakeAdb(route=False)
+	adb.fail_broadcast = "adb broadcast timed out"
+	shield, _, pub = make(adb)
+	run(shield.poll_once(force=True))
+	run(shield.handle(cmd("turn_on")))
+	assert pub.results[0]["outcome"] == "unknown"
+	assert pub.states[-1] == {"exit_node": None, "online": True, "ts": int(NOW)}
+	assert pub.availability[-1] is True
+
+def test_broadcast_error_with_unreachable_shield_publishes_offline():
+	adb = FakeAdb()
+	adb.fail_broadcast = "adb exited 1: device offline"
+	shield, _, pub = make(adb)
+	run(shield.poll_once(force=True))
+	adb.fail_reads = True
+	run(shield.handle(cmd("turn_on")))
+	assert pub.states[-1] == {"exit_node": None, "online": False, "ts": int(NOW)}
+	assert pub.availability[-1] is False
+
+def slow_adb(monkeypatch, per_call, script):
+	"""Real Adb whose every subprocess takes per_call seconds (and times out at the ADB timeout, scaled down)."""
+	monkeypatch.setattr(shield_service, "ADB_TIMEOUT_SECONDS", per_call)
+	calls = []
+	async def fake_exec(*args, **kw):
+		calls.append(args)
+		return script(args)
+	monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+	return Adb("t:5555", "ha-main-remote"), calls
+
+def test_verification_read_sequence_is_capped_by_the_deadline(monkeypatch):
+	import time
+	# Every call hangs to its timeout: shell, connect, shell would be 3 x 0.3 s without a shared deadline.
+	adb, calls = slow_adb(monkeypatch, 0.3, lambda a: FakeProc("", hang=True))
+	started = time.monotonic()
+	with pytest.raises(AdbError):
+		run(adb.route_uses_exit_node(deadline=time.monotonic() + 0.4))
+	assert time.monotonic() - started < 0.6
+
+def test_whole_command_stays_inside_verify_budget_with_real_adb(monkeypatch):
+	import time
+	def script(args):
+		if "am broadcast" in args[-1]:
+			return FakeProc("Broadcast completed: result=0")
+		return FakeProc("", hang=True)
+	adb, _ = slow_adb(monkeypatch, 0.3, script)
+	pub = FakePublisher()
+	shield = Shield(adb, pub, clock=time.time, verify_seconds=0.4, verify_poll=0.01)
+	started = time.monotonic()
+	run(shield.handle(json.dumps({"id": "x", "command": "turn_on", "ts": time.time()})))
+	# verify budget 0.4 s plus the reachability-free path; unscoped it would be several multiples of 0.3 s per read.
+	assert time.monotonic() - started < 0.9
+	assert pub.results[0]["outcome"] == "unknown"
+
+def test_broadcast_is_not_resent_after_the_command_expired(monkeypatch):
+	import time
+	state = {"shell": 0}
+	def script(args):
+		if args[1] == "connect":
+			return FakeProc("connected to t:5555")
+		state["shell"] += 1
+		return FakeProc("error: device offline", rc=1)
+	adb, calls = slow_adb(monkeypatch, 1, script)
+	async def slow_connect(deadline=None):
+		await asyncio.sleep(0.15)
+	monkeypatch.setattr(adb, "connect", slow_connect)
+	with pytest.raises(AdbError):
+		run(adb.broadcast("ha-main-remote", deadline=time.monotonic() + 0.1))
+	assert state["shell"] == 1
+
+def test_command_deadline_reaches_the_broadcast():
+	seen = {}
+	class Spy(FakeAdb):
+		async def broadcast(self, node, deadline=None):
+			seen["left"] = deadline - __import__("time").monotonic()
+			await super().broadcast(node)
+	shield, _, _ = make(Spy())
+	run(shield.handle(cmd("turn_on", ts=NOW - 15)))
+	# Accepted at age 15 s of a 20 s window: roughly 5 s of life left, never the full 20.
+	assert 4 < seen["left"] <= 5.1

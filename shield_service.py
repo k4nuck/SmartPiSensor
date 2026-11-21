@@ -35,10 +35,13 @@ MAX_FUTURE_SKEW_SECONDS = 5
 RESULT_CACHE_SECONDS = 600
 COMMAND_DRAIN_SECONDS = 5
 CLOSE_PUBLISH_WAIT_SECONDS = 3
+RESULT_SEND_ATTEMPTS = 5
+RESULT_RETRY_SECONDS = 0.5
 # Any address outside the LAN works; the route to it is what shows whether the exit node is carrying traffic.
 PROBE_ADDRESS = "1.1.1.1"
 
 OK, REJECTED, FAILED, UNKNOWN = "ok", "rejected", "failed", "unknown"
+PROBE = object()
 
 def _topic(slug, leaf):
 	return "%s/%s/%s" % (TOPIC_ROOT, slug, leaf)
@@ -67,14 +70,22 @@ class Adb:
 		self.target = target
 		self.exit_node_name = exit_node_name
 
-	async def _run(self, *args):
+	# deadline is an absolute time.monotonic() value. Each call gets min(ADB_TIMEOUT, time left), so a connect-and-retry
+	# sequence can never add up to more than the caller's budget.
+	async def _run(self, *args, deadline=None):
+		timeout = ADB_TIMEOUT_SECONDS
+		if deadline is not None:
+			remaining = deadline - time.monotonic()
+			if remaining <= 0:
+				raise AdbError("adb %s not run: deadline passed" % args[0])
+			timeout = min(timeout, remaining)
 		try:
 			proc = await asyncio.create_subprocess_exec(
 				"adb", *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
 		except OSError as error:
 			raise AdbError("adb failed to run: %r" % (error,))
 		try:
-			out, _ = await asyncio.wait_for(proc.communicate(), ADB_TIMEOUT_SECONDS)
+			out, _ = await asyncio.wait_for(proc.communicate(), timeout)
 		except asyncio.TimeoutError:
 			proc.kill()
 			await proc.wait()
@@ -88,26 +99,27 @@ class Adb:
 		return text
 
 	# adb connect exits 0 even when it fails, so judge by its text. Needed after every SHIELD or Pi reboot.
-	async def connect(self):
-		text = await self._run("connect", self.target)
+	async def connect(self, deadline=None):
+		text = await self._run("connect", self.target, deadline=deadline)
 		if "connected to" not in text:
 			raise AdbError("adb connect: %s" % text.strip()[:200])
 
-	async def _shell(self, command):
+	# The deadline is rechecked before the resend, so a retry after a slow reconnect cannot run a command that has since expired.
+	async def _shell(self, command, deadline=None):
 		try:
-			return await self._run("-s", self.target, "shell", command)
+			return await self._run("-s", self.target, "shell", command, deadline=deadline)
 		except AdbError:
-			await self.connect()
-			return await self._run("-s", self.target, "shell", command)
+			await self.connect(deadline)
+			return await self._run("-s", self.target, "shell", command, deadline=deadline)
 
-	async def route_uses_exit_node(self):
-		return parse_route(await self._shell("ip route get %s" % PROBE_ADDRESS))
+	async def route_uses_exit_node(self, deadline=None):
+		return parse_route(await self._shell("ip route get %s" % PROBE_ADDRESS, deadline))
 
 	# adb joins shell args into one remote command line, so the empty value for "no exit node" has to be quoted into it
 	# or the remote shell drops it.
-	async def broadcast(self, node):
+	async def broadcast(self, node, deadline=None):
 		command = "am broadcast -a com.tailscale.ipn.USE_EXIT_NODE -n com.tailscale.ipn/.IPNReceiver --es exitNode %s --ez allowLanAccess true" % shlex.quote(node)
-		text = await self._shell(command)
+		text = await self._shell(command, deadline)
 		# am exits 0 even when nothing received the broadcast.
 		if "Broadcast completed" not in text:
 			raise AdbError("broadcast not delivered: %s" % text.strip()[:200])
@@ -173,27 +185,33 @@ class MqttPublisher:
 		return info
 
 	# Not retained: a stale result would answer the wrong future command. Dropped while disconnected; HA times out to UNKNOWN.
+	# Returns False when it was not queued (broker down or client queue full) so the caller can retry.
 	def publish_result(self, result):
 		with self._lock:
 			if not self._connected:
-				logging.warning("ShieldMQTT:broker down, dropping result for %s", result.get("id"))
-				return
+				logging.warning("ShieldMQTT:broker down, result for %s not sent", result.get("id"))
+				return False
 			info = self.client.publish(_topic(self.slug, "result"), json.dumps(result), qos=1, retain=False)
 			if info.rc != mqtt.MQTT_ERR_SUCCESS:
 				logging.warning("ShieldMQTT:result publish returned rc=%s", info.rc)
+				return False
+			return True
 
 	def publish_state(self, state):
 		payload = json.dumps(state)
 		with self._lock:
 			self._latest_state = payload
 			if self._connected:
-				self._send(_topic(self.slug, "state"), payload)
+				return self._send(_topic(self.slug, "state"), payload).rc == mqtt.MQTT_ERR_SUCCESS
+			# Not connected: _on_connect sends the latest value, so nothing is lost.
+			return True
 
 	def publish_availability(self, online):
 		with self._lock:
 			self._latest_online = online
 			if self._connected:
-				self._send(_topic(self.slug, "availability"), "online" if online else "offline")
+				return self._send(_topic(self.slug, "availability"), "online" if online else "offline").rc == mqtt.MQTT_ERR_SUCCESS
+			return True
 
 	def begin_close(self):
 		with self._lock:
@@ -244,8 +262,11 @@ class Shield:
 	def _publish(self, exit_node, online, force=False):
 		key = (exit_node, online)
 		if force or key != self._last:
-			self.publisher.publish_state(build_state(exit_node, online, self.clock()))
-			self._last = key
+			# A refused publish leaves _last unset so the next poll sends it again instead of waiting for the forced refresh.
+			if self.publisher.publish_state(build_state(exit_node, online, self.clock())) is not False:
+				self._last = key
+			else:
+				self._last = object()
 		self.publisher.publish_availability(online)
 
 	async def poll_once(self, force=False):
@@ -283,15 +304,27 @@ class Shield:
 		self._inflight.add(task)
 		try:
 			try:
-				result = await self._handle(payload)
+				result, sent = await self._handle(payload)
 			except asyncio.CancelledError:
 				raise
 			except Exception as error:
 				logging.exception("Shield:command crashed")
-				result = _result(None, UNKNOWN, "internal error: %r" % (error,))
-			self.publisher.publish_result(result)
+				result, sent = _result(None, UNKNOWN, "internal error: %r" % (error,)), False
+			if not sent:
+				await self._send_result(result)
 		finally:
 			self._inflight.discard(task)
+
+	# The result is what the HA caller is waiting on, so it goes out before any state and is retried if the client queue
+	# is momentarily full of unacknowledged state publishes.
+	async def _send_result(self, result):
+		for attempt in range(RESULT_SEND_ATTEMPTS):
+			if self.publisher.publish_result(result) is not False:
+				return True
+			if attempt + 1 < RESULT_SEND_ATTEMPTS:
+				await asyncio.sleep(RESULT_RETRY_SECONDS)
+		logging.error("Shield:result for %s could not be published", result.get("id"))
+		return False
 
 	async def drain(self, timeout):
 		pending = set(self._inflight)
@@ -324,55 +357,78 @@ class Shield:
 			if not isinstance(command, dict):
 				raise ValueError("not an object")
 		except (ValueError, TypeError):
-			return _result(None, REJECTED, "command is not a JSON object")
+			return _result(None, REJECTED, "command is not a JSON object"), False
 		cmd_id = command.get("id")
 		if not isinstance(cmd_id, str) or not cmd_id:
-			return _result(None, REJECTED, "missing command id")
+			return _result(None, REJECTED, "missing command id"), False
 
 		# Under the lock so a redelivery arriving mid-flight waits and then gets the cached answer instead of broadcasting again.
 		async with self._lock:
 			self._purge()
 			cached = self._results.get(cmd_id)
 			if cached:
-				return cached[1]
+				return cached[1], False
 			if self.closing:
-				return _result(cmd_id, REJECTED, "service is stopping")
+				return _result(cmd_id, REJECTED, "service is stopping"), False
 			name = command.get("command")
+			observed = None
 			if name not in ("turn_on", "turn_off"):
 				result = _result(cmd_id, REJECTED, "unknown command %r" % (name,))
 			else:
-				error = self._check_ts(command.get("ts"))
+				ts = command.get("ts")
+				error = self._check_ts(ts)
 				if error:
 					result = _result(cmd_id, REJECTED, error)
 				else:
-					result = await self._apply(cmd_id, name == "turn_on")
+					# Wall-clock expiry converted once, so the adb layer can enforce it on monotonic time.
+					expires = self.monotonic() + (ts + COMMAND_WINDOW_SECONDS - self.clock())
+					result, observed = await self._apply(cmd_id, name == "turn_on", expires)
 			self._results[cmd_id] = (self.monotonic() + RESULT_CACHE_SECONDS, result)
-			return result
+			sent = False
+			if observed is not None:
+				# Result first, then state, so queued state can never crowd the answer out.
+				sent = await self._send_result(result)
+				if observed is PROBE:
+					observed = (None, await self._reachable())
+				self._publish(observed[0], observed[1], force=True)
+			return result, sent
 
-	async def _apply(self, cmd_id, want):
+	# After a failed broadcast the SHIELD may or may not have changed, so the route is unknown, but whether adb can still
+	# reach it is knowable and decides availability.
+	async def _reachable(self):
 		try:
-			await self.adb.broadcast(self.adb.exit_node_name if want else "")
+			await self.adb.route_uses_exit_node(deadline=self.monotonic() + ADB_TIMEOUT_SECONDS)
+			return True
+		except AdbError:
+			return False
+
+	# Returns (result, observed): observed is (exit_node, online) to publish after the result, PROBE to publish unknown
+	# with probed reachability, or None when nothing was attempted.
+	async def _apply(self, cmd_id, want, expires):
+		try:
+			await self.adb.broadcast(self.adb.exit_node_name if want else "", deadline=expires)
 		except AdbError as error:
 			# A timeout may still have delivered the broadcast, so only a clean refusal is "failed".
 			logging.warning("Shield:broadcast failed: %s", error)
-			return _result(cmd_id, UNKNOWN, str(error))
+			return _result(cmd_id, UNKNOWN, str(error)), PROBE
+		# One budget for every read, including each read's own reconnect and retry.
 		deadline = self.monotonic() + self.verify_seconds
 		actual = None
 		while True:
 			try:
-				actual = await self.adb.route_uses_exit_node()
+				actual = await self.adb.route_uses_exit_node(deadline=deadline)
 			except AdbError as error:
 				logging.warning("Shield:verify route check failed: %s", error)
 				actual = None
 			if actual is want or self.monotonic() >= deadline:
 				break
-			await asyncio.sleep(self.verify_poll)
-		self._publish(actual, actual is not None, force=True)
+			await asyncio.sleep(min(self.verify_poll, max(0, deadline - self.monotonic())))
+		observed = (actual, actual is not None)
 		if actual is want:
-			return _result(cmd_id, OK, None, actual)
+			return _result(cmd_id, OK, None, actual), observed
 		if actual is None:
-			return _result(cmd_id, UNKNOWN, "broadcast sent but the route could not be read back")
-		return _result(cmd_id, FAILED, "broadcast sent but the route did not switch within %d s" % self.verify_seconds, actual)
+			return _result(cmd_id, UNKNOWN, "broadcast sent but the route could not be read back"), observed
+		return _result(cmd_id, FAILED, "broadcast sent but the route did not switch within %d s" % self.verify_seconds, actual), observed
 
 def _dispatch(loop, shield):
 	def handler(payload):
