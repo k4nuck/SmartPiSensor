@@ -115,3 +115,19 @@ Watch with `mosquitto_sub -t 'upstate/ecobee/+/result' -v`.
 Deploying this change on gergy-upstate: `cd ~/projects/dht22 && git pull && sudo systemctl restart ecobee-reader` (no new dependencies, no config change).
 `set_fan` writes the aiohomekit-documented speed (100 = on, 0 = auto). **Before trusting `set_preset` on the real thermostats**, confirm the hold-schedule value encoding (`PRESET_VALUES` in `ecobee_control.py`) on site; it was written without ecobee hardware.
 Timing: HA waits 25 s for `/result`. Discovery, pre-read, writes and readbacks share one 15 s budget from receipt, the `/result` is published first, and only then is the state refreshed.
+
+# SHIELD exit-node switch (gergy-upstate Pi, gergy-incidents#1893)
+
+`shield_service.py` turns the upstate SHIELD's Tailscale exit node on/off over adb so the in-laws' streaming apps route through ha-main.
+It needs `adb` on the Pi (`apt install adb`), already authorized to the SHIELD, and only paho (the sensor's venv works; no aiohomekit).
+Optional `config.ini` keys, defaults shown: `shield_slug = upstate_tv`, `shield_adb = 192.168.1.62:5555`, `shield_exit_node = ha-main-remote`. MQTT client id is `<client_id>-shield-<slug>`.
+
+- `upstate/shield/<slug>/set` in (QoS 1, not retained): `{"id","command":"turn_on"|"turn_off","ts"}`. Same 20 s window / 5 s skew / 10 min id cache as the ecobee commands.
+- `upstate/shield/<slug>/result` out: `{"id","outcome":"ok|rejected|failed|unknown","error","exit_node"}`. `ok` only after `ip route get 1.1.1.1` on the SHIELD shows (or stops showing) a `tun*` device, polled up to 10 s.
+- `upstate/shield/<slug>/state` retained: `{"exit_node": true|false|null, "online", "ts"}`. Route checked every 15 s, published on change and at least every 3 min. `null` = adb unreachable or route unreadable.
+- `upstate/shield/<slug>/availability`: `online` while adb answers, else `offline`; also the LWT.
+
+Unit `/etc/systemd/system/shield-exit-node.service` (same shape as the ecobee one, `ExecStart=<venv>/bin/python shield_service.py`, `Restart=always`, `RestartSec=30`, `TimeoutStopSec=15`).
+The service starts with no network or SHIELD: MQTT retries on its own and each adb call reconnects once before reporting offline.
+
+**Unverified:** "off" is the same broadcast with an empty `exitNode`. Confirm on site that this clears the exit node on Tailscale 1.104.6 (the `ip route get` check will report `failed` if it does not).
