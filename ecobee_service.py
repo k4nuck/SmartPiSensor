@@ -3,9 +3,12 @@
 #
 #  ecobee_service.py
 #
-# Reads paired ecobee thermostats over HomeKit (read-only) and publishes retained JSON to the home MQTT broker:
+# Reads paired ecobee thermostats over HomeKit and publishes retained JSON to the home MQTT broker:
 #   upstate/ecobee/<device_id>/state         JSON, see ecobee_state.build_state
 #   upstate/ecobee/<device_id>/availability  online | offline (LWT)
+# and executes commands (see ecobee_control.py):
+#   upstate/ecobee/<device_id>/set           command JSON in, not retained
+#   upstate/ecobee/<device_id>/result        outcome JSON out, not retained
 
 import asyncio
 import json
@@ -18,6 +21,7 @@ import time
 import paho.mqtt.client as mqtt
 
 from config import load_config, ConfigError
+from ecobee_control import Controller, WritablePairing
 from ecobee_hk import open_controller
 from ecobee_state import discover_layout, read_ids, build_state, thermostat_answered
 from ecobee_store import pairings_path, load_pairings
@@ -33,6 +37,8 @@ OFFLINE_AFTER_FAILURES = 2
 LAYOUT_REFRESH_SECONDS = 600
 # systemd gives us 15 s (TimeoutStopSec) to stop; the offline publication must land inside it even if a read hangs.
 CLOSE_PUBLISH_WAIT_SECONDS = 3
+# A command mid-write gets this long to finish and publish its /result before shutdown cancels it.
+COMMAND_DRAIN_SECONDS = 5
 
 def state_topic(device_id):
 	return "%s/%s/state" % (TOPIC_ROOT, device_id)
@@ -40,8 +46,15 @@ def state_topic(device_id):
 def availability_topic(device_id):
 	return "%s/%s/availability" % (TOPIC_ROOT, device_id)
 
+def set_topic(device_id):
+	return "%s/%s/set" % (TOPIC_ROOT, device_id)
+
+def result_topic(device_id):
+	return "%s/%s/result" % (TOPIC_ROOT, device_id)
+
 # The only pairing methods the poller may reach. Anything that mutates the thermostat or its pairings
 # (put_characteristics, add/remove_pairing, identify, ...) is deliberately absent, so a stray call raises AttributeError.
+# Writes go only through ecobee_control.WritablePairing.
 class ReadOnlyPairing:
 	def __init__(self, pairing):
 		self._pairing = pairing
@@ -69,10 +82,12 @@ class MqttPublisher:
 		self._connected = False
 		self._latest_state = None
 		self._latest_online = None
+		self._command_handler = None
 		self.client = mqtt.Client(client_id)
 		self.client.will_set(availability_topic(device_id), "offline", qos=1, retain=True)
 		self.client.on_connect = self._on_connect
 		self.client.on_disconnect = self._on_disconnect
+		self.client.on_message = self._on_message
 		# Backstop for messages caught in flight by a drop; the latest-value policy above is what keeps the backlog small.
 		self.client.max_queued_messages_set(4)
 		self.client.max_inflight_messages_set(4)
@@ -92,6 +107,37 @@ class MqttPublisher:
 				self._send(state_topic(self.device_id), self._latest_state)
 			if self._latest_online is not None:
 				self._send(availability_topic(self.device_id), "online" if self._latest_online else "offline")
+			# Clean session: the broker forgets our subscription on every drop, so it is re-made on every connect.
+			if self._command_handler is not None:
+				self.client.subscribe(set_topic(self.device_id), qos=1)
+
+	# handler(payload_bytes) runs on paho's network thread and must not block.
+	def set_command_handler(self, handler):
+		with self._lock:
+			self._command_handler = handler
+			if self._connected:
+				self.client.subscribe(set_topic(self.device_id), qos=1)
+
+	def _on_message(self, client, userdata, message):
+		# A retained command is a replay of something already acted on or long expired; never act on it.
+		if message.retain or self._command_handler is None:
+			return
+		try:
+			self._command_handler(message.payload)
+		except Exception:
+			logging.exception("EcobeeMQTT:%s:command handler failed", self.device_id)
+
+	# Not retained: a result is an answer to one request, and a stale one would answer the wrong future command.
+	# Dropped while disconnected rather than queued; HA then reports UNKNOWN, which is the contract for no answer.
+	def publish_result(self, result):
+		payload = json.dumps(result)
+		with self._lock:
+			if not self._connected:
+				logging.warning("EcobeeMQTT:%s:broker down, dropping result for %s", self.device_id, result.get("id"))
+				return
+			info = self.client.publish(result_topic(self.device_id), payload, qos=1, retain=False)
+			if info.rc != mqtt.MQTT_ERR_SUCCESS:
+				logging.warning("EcobeeMQTT:%s:result publish returned rc=%s", self.device_id, info.rc)
 
 	def _on_disconnect(self, client, userdata, rcode):
 		with self._lock:
@@ -215,22 +261,40 @@ class Poller:
 def _device_name(alias):
 	return alias.replace("-", " ").replace("_", " ").title()
 
+# Hands a command from paho's thread to the event loop. A closed loop (shutdown race) just drops it: HA times out to UNKNOWN.
+def _dispatch(loop, commander):
+	def handler(payload):
+		try:
+			asyncio.run_coroutine_threadsafe(commander.handle(payload), loop)
+		except RuntimeError:
+			logging.warning("Ecobee:%s:loop closed, command dropped", commander.device_id)
+	return handler
+
 async def run_service(cfg, stop):
 	pairings = load_pairings(pairings_path(cfg))
 	if not pairings:
 		raise ConfigError("No paired ecobees in %s; run ecobee_pair.py <name> <setup-code> first" % pairings_path(cfg))
 
 	publishers = []
+	commanders = []
 	async with open_controller() as controller:
 		try:
 			tasks = []
+			loop = asyncio.get_running_loop()
 			for alias, data in pairings.items():
-				pairing = ReadOnlyPairing(controller.load_pairing(alias, data))
+				raw = controller.load_pairing(alias, data)
 				publisher = MqttPublisher("%s-ecobee-%s" % (cfg["client_id"], alias), cfg["broker_host"], cfg["broker_port"], alias)
 				publishers.append(publisher)
-				tasks.append(asyncio.create_task(Poller(alias, _device_name(alias), pairing, publisher).run(stop)))
+				poller = Poller(alias, _device_name(alias), ReadOnlyPairing(raw), publisher)
+				commander = Controller(alias, WritablePairing(raw), publisher, poller.poll_once)
+				commanders.append(commander)
+				publisher.set_command_handler(_dispatch(loop, commander))
+				tasks.append(asyncio.create_task(poller.run(stop)))
 			await asyncio.gather(*tasks)
 		finally:
+			for commander in commanders:
+				commander.closing = True
+			await asyncio.gather(*(c.drain(COMMAND_DRAIN_SECONDS) for c in commanders))
 			# Offline first: it is the promise to HA, and controller teardown below can be slow.
 			close_publishers(publishers)
 

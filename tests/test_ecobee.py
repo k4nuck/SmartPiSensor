@@ -390,3 +390,28 @@ def test_service_stops_within_deadline_with_a_hung_read_and_closes_publishers(tm
 			await asyncio.wait_for(task, 2)
 	asyncio.run(go())
 	assert len(closed) == 1
+
+def test_publisher_subscribes_to_set_on_every_connect_and_hands_commands_over():
+	pub, client = _publisher()
+	got = []
+	pub.set_command_handler(got.append)
+	pub._on_connect(None, None, None, 0)
+	pub._on_connect(None, None, None, 0)
+	assert client.subscribe.call_args_list == [mock.call("upstate/ecobee/living-room/set", qos=1)] * 2
+	pub._on_message(None, None, mock.Mock(payload=b"{}", retain=False))
+	assert got == [b"{}"]
+
+def test_retained_command_is_never_acted_on():
+	pub, _ = _publisher()
+	got = []
+	pub.set_command_handler(got.append)
+	pub._on_message(None, None, mock.Mock(payload=b"{}", retain=True))
+	assert got == []
+
+def test_result_is_published_not_retained_and_dropped_while_disconnected():
+	pub, client = _publisher()
+	pub.publish_result({"id": "a"})
+	client.publish.assert_not_called()
+	pub._on_connect(None, None, None, 0)
+	pub.publish_result({"id": "a"})
+	client.publish.assert_called_once_with("upstate/ecobee/living-room/result", '{"id": "a"}', qos=1, retain=False)

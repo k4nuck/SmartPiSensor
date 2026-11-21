@@ -52,14 +52,14 @@ On the crawlspace Pi the existing `wait-for-broker.conf` drop-in can stay; the p
 
 # ecobee reader (crawlspace Pi only)
 
-`ecobee_service.py` is a separate service from the DHT22 sensor. It pairs with the upstate ecobees as a read-only HomeKit controller
+`ecobee_service.py` is a separate service from the DHT22 sensor. It pairs with the upstate ecobees as a HomeKit controller
 and publishes retained JSON to the home broker (the same `broker_host`/`broker_port` as `config.ini`; no new settings):
 
 - `upstate/ecobee/<device_id>/state`: `{"name","temperature_f","humidity","hvac_mode","hvac_action","target_heat_f","target_cool_f","sensors":[{"name","temperature_f","occupancy"}],"ts"}`, null where a field isn't exposed. Every 60 s.
 - `upstate/ecobee/<device_id>/availability`: `online` / `offline`. `offline` is the broker's last-will, and is also published after 2 failed polls in a row (~2 min) and on clean shutdown.
 
 `<device_id>` is the name given to `ecobee_pair.py` (lower-cased, e.g. `living-room`). `name` in the payload is that name title-cased ("Living Room").
-It never writes to a thermostat: the poller only holds a facade with `get_characteristics` and `list_accessories_and_characteristics`.
+The poller only holds a read-only facade; writes happen only in `ecobee_control.py`, in answer to commands (below).
 
 ## Install
 1. Own venv (do not touch the dht22 one): `python3 -m venv ~/ecobee-venv && ~/ecobee-venv/bin/pip install -r requirements-ecobee.txt`.
@@ -105,3 +105,12 @@ An ecobee can only be paired once without resetting it; the keys in `ecobee/pair
 On gergy-voice (192.168.1.207): `pip install -r requirements-dev.txt`, then `python tools/fake_homekit_thermostat.py` (setup code `123-45-678`, port 51826; a thermostat plus one room sensor).
 On the Pi (or any host on that LAN) run `ecobee_pair.py fake 123-45-678` then the service. Stopping the fake flips `availability` to `offline` after ~2 min; restarting it flips back to `online`.
 Watch with `mosquitto_sub -t 'upstate/#' -v`.
+
+## Commands (gergy-incidents#1878)
+The service subscribes (QoS 1, non-retained) to `upstate/ecobee/<device_id>/set` and answers on `upstate/ecobee/<device_id>/result` (QoS 1, non-retained).
+Commands: `set_mode`, `set_setpoint`, `turn_off`, `turn_on`, `set_fan`, `set_preset`, `resume_schedule`; envelope `{"id","command","parameters","ts"}`, temperatures in F.
+Limits enforced on the Pi: heat targets 45-78 F, cool 65-90 F, auto deadband 3 F (the ecobee exposes none over HomeKit). Window: `ts`+30 s, `ts` at most 5 s in the future. A repeated `id` within 10 minutes returns the cached result and never writes again.
+Watch with `mosquitto_sub -t 'upstate/ecobee/+/result' -v`.
+
+Deploying this change on gergy-upstate: `cd ~/projects/dht22 && git pull && sudo systemctl restart ecobee-reader` (no new dependencies, no config change).
+**Before trusting `set_fan` / `set_preset` on the real thermostats**, confirm the fan-speed and hold-schedule value encodings (`FAN_VALUES`, `PRESET_VALUES` in `ecobee_control.py`) on site; they were written without ecobee hardware.
