@@ -319,19 +319,35 @@ def test_write_that_hangs_times_out_as_unknown(monkeypatch):
 
 # -- fan, preset, resume
 
-@pytest.mark.parametrize("fan", ["on", "auto"])
-def test_set_fan(fan):
-	rig = Rig()
-	rig.pairing.state[rig.c("fan_read")] = 1 if fan == "auto" else 0
+# The fake follows aiohomekit's documented encoding (100 on, 0 off/auto) instead of mirroring whatever it is given, and the
+# expected values are literals, so a wrong constant fails here rather than being echoed back.
+def _documented_fan(rig):
 	original = rig.pairing.put_characteristics
-	async def mirror(chars):
+	async def device(chars):
 		out = await original(chars)
-		rig.pairing.state[rig.c("fan_read")] = rig.value(rig.c("fan_write"))
+		rig.pairing.state[rig.c("fan_read")] = 100 if rig.value(rig.c("fan_write")) == 100 else 0
 		return out
-	rig.pairing.put_characteristics = mirror
+	rig.pairing.put_characteristics = device
+
+@pytest.mark.parametrize("fan,written", [("on", 100), ("auto", 0)])
+def test_set_fan_uses_the_documented_encoding(fan, written):
+	rig = Rig()
+	_documented_fan(rig)
+	rig.pairing.state[rig.c("fan_read")] = 0 if fan == "on" else 100
+	rig.pairing.state[rig.c("fan_write")] = 0 if fan == "on" else 100
 	result = rig.send("set_fan", {"fan": fan})
 	assert result["outcome"] == "ok" and result["applied"] == {"fan": fan}
-	assert rig.pairing.puts == [(rig.c("fan_write"), ecobee_control.FAN_VALUES[fan])]
+	assert rig.pairing.puts == [(rig.c("fan_write"), written)]
+
+def test_fan_on_is_not_confirmed_by_a_nonzero_wrong_speed():
+	rig = Rig()
+	original = rig.pairing.put_characteristics
+	async def odd_device(chars):
+		out = await original(chars)
+		rig.pairing.state[rig.c("fan_read")] = 1
+		return out
+	rig.pairing.put_characteristics = odd_device
+	assert rig.send("set_fan", {"fan": "on"})["outcome"] == "failed"
 
 def test_set_fan_rejects_other_values():
 	rig = Rig()
@@ -391,11 +407,11 @@ def test_missing_vendor_characteristics_reject_instead_of_crashing():
 # -- timing
 
 def test_expired_command_is_rejected_without_writing():
-	rig = Rig(now=NOW + 31)
+	rig = Rig(now=NOW + 21)
 	_assert_rejected(rig, rig.send("turn_off", ts=NOW), "expired")
 
 def test_command_at_the_edge_of_the_window_still_runs():
-	rig = Rig(now=NOW + 30)
+	rig = Rig(now=NOW + 20)
 	assert rig.send("turn_off", ts=NOW)["outcome"] == "ok"
 
 def test_future_skewed_ts_is_rejected():
@@ -519,3 +535,225 @@ def test_controller_is_the_only_module_that_writes():
 			if any(isinstance(n, ast.Attribute) and n.attr == "put_characteristics" for n in ast.walk(tree)):
 				writers.append(fname)
 	assert writers == ["ecobee_control.py"]
+
+
+# -- rework of the first review (#1878)
+
+def _spy_pairs(rig):
+	seen = []
+	original = rig.pairing.put_characteristics
+	async def spy(chars):
+		out = await original(chars)
+		seen.append((c_to_f_state(rig, "heat_threshold"), c_to_f_state(rig, "cool_threshold")))
+		return out
+	rig.pairing.put_characteristics = spy
+	return seen
+
+def test_ignored_first_write_stops_before_the_dependent_write():
+	rig = Rig()
+	_setpoints(rig, heat=68, cool=72)
+	rig.pairing.ignore = {rig.t("cool_threshold")}   # acked, not applied
+	result = rig.send("set_setpoint", {"heat_setpoint": 74, "cool_setpoint": 78})
+	assert [ident for ident, _ in rig.pairing.puts] == [rig.t("cool_threshold")]
+	assert result["outcome"] == "failed" and "readback mismatch" in result["error"]
+	assert c_to_f_state(rig, "cool_threshold") - c_to_f_state(rig, "heat_threshold") >= 3.9
+	assert rig.republished == 1
+
+def test_deadband_is_rechecked_against_the_value_the_device_actually_holds():
+	rig = Rig()
+	_setpoints(rig, heat=68, cool=72)
+	original = rig.pairing.put_characteristics
+	async def rounds_down(chars):
+		out = await original(chars)
+		rig.pairing.state[rig.t("cool_threshold")] = f_to_c(77.7)   # within readback tolerance of 78, but only 2.7 F above heat 75
+		return out
+	rig.pairing.put_characteristics = rounds_down
+	result = rig.send("set_setpoint", {"heat_setpoint": 75, "cool_setpoint": 78})
+	assert [ident for ident, _ in rig.pairing.puts] == [rig.t("cool_threshold")]
+	assert result["outcome"] == "partial" and "second write not issued" in result["error"]
+	assert result["applied"] == {"cool_setpoint": 78.0}
+
+def test_unverifiable_first_write_does_not_issue_the_second():
+	rig = Rig()
+	_setpoints(rig, heat=68, cool=72)
+	original = rig.pairing.put_characteristics
+	async def then_link_drops(chars):
+		out = await original(chars)
+		rig.pairing.read_error = True
+		return out
+	rig.pairing.put_characteristics = then_link_drops
+	result = rig.send("set_setpoint", {"heat_setpoint": 74, "cool_setpoint": 78})
+	assert len(rig.pairing.puts) == 1 and result["outcome"] == "unknown"
+
+def test_78f_survives_off_then_on():
+	rig = Rig()
+	_mode(rig, "heat")
+	assert rig.send("set_setpoint", {"heat_setpoint": 78}, id="1")["outcome"] == "ok"
+	assert rig.send("turn_off", id="2")["outcome"] == "ok"
+	assert rig.send("turn_on", id="3")["outcome"] == "ok"
+	assert rig.value(rig.t("mode")) == 1
+
+@pytest.mark.parametrize("f", [78.04, 44.96])
+def test_requests_are_judged_after_quantizing_to_the_device_step(f):
+	rig = Rig()
+	_mode(rig, "heat")
+	assert rig.send("set_setpoint", {"heat_setpoint": f})["outcome"] == "ok"
+
+@pytest.mark.parametrize("f", [78.2, 44.8])
+def test_requests_that_quantize_outside_the_bounds_are_rejected(f):
+	rig = Rig()
+	_mode(rig, "heat")
+	_assert_rejected(rig, rig.send("set_setpoint", {"heat_setpoint": f}), "outside the allowed")
+
+@pytest.mark.parametrize("heat", [66, 67, 68, 69, 70.5, 71])
+def test_exact_deadband_survives_quantization(heat):
+	rig = Rig()
+	_setpoints(rig, heat=60, cool=90)
+	assert rig.send("set_setpoint", {"heat_setpoint": heat, "cool_setpoint": heat + 3})["outcome"] == "ok"
+
+def test_deadband_just_under_three_degrees_is_rejected():
+	rig = Rig()
+	_setpoints(rig, heat=60, cool=90)
+	_assert_rejected(rig, rig.send("set_setpoint", {"heat_setpoint": 68, "cool_setpoint": 70.5}), "at least 3 F below")
+
+def test_auto_preset_violating_the_deadband_is_rejected_before_any_write():
+	rig = _preset_rig()
+	rig.pairing.state[rig.c("home_heat")] = f_to_c(70)
+	rig.pairing.state[rig.c("home_cool")] = f_to_c(72)
+	_assert_rejected(rig, rig.send("set_preset", {"preset": "home"}), "at least 3 F below")
+
+def test_preset_deadband_is_not_applied_outside_auto():
+	rig = _preset_rig()
+	_mode(rig, "heat")
+	rig.pairing.state[rig.c("home_heat")] = f_to_c(70)
+	rig.pairing.state[rig.c("home_cool")] = f_to_c(72)
+	assert rig.send("set_preset", {"preset": "home"})["outcome"] == "ok"
+
+def test_discovery_failure_is_a_rejection_that_keeps_the_command_id():
+	pairing = FakePairing()
+	rig = Rig(pairing)
+	async def broken():
+		raise OSError("not connected")
+	rig.pairing.accessories = []
+	rig.pairing.list_accessories_and_characteristics = broken
+	result = rig.send("turn_off", id="keepme")
+	assert result["id"] == "keepme" and result["outcome"] == "rejected" and "discover" in result["error"]
+	assert rig.pairing.puts == [] and rig.republished == 0
+	assert rig.send("turn_off", id="keepme") == result   # cached, correlated
+
+def test_discovery_timeout_is_a_rejection(monkeypatch):
+	monkeypatch.setattr(ecobee_control, "IO_TIMEOUT_SECONDS", 0.05)
+	rig = Rig()
+	async def hang():
+		await asyncio.sleep(5)
+	rig.pairing.accessories = []
+	rig.pairing.list_accessories_and_characteristics = hang
+	result = rig.send("turn_off", id="t")
+	assert result["id"] == "t" and result["outcome"] == "rejected"
+
+def test_result_is_published_before_the_state_refresh_and_not_delayed_by_it():
+	rig = Rig()
+	order = []
+	original = rig.publisher.publish_result
+	rig.publisher.publish_result = lambda r: (order.append("result"), original(r))
+	async def slow_refresh():
+		order.append("refresh-start")
+		await asyncio.sleep(0.2)
+		order.append("refresh-end")
+	rig.controller.republish = slow_refresh
+	rig.send("turn_off")
+	assert order == ["result", "refresh-start", "refresh-end"]
+
+def test_rejected_and_cached_answers_trigger_no_refresh():
+	rig = Rig()
+	rig.send("turn_off", id="x")
+	rig.send("turn_off", id="x")
+	rig.send("set_mode", {"mode": "bad"}, id="y")
+	assert rig.republished == 1
+
+def test_refresh_is_skipped_once_the_service_is_stopping():
+	rig = Rig()
+	original = rig.controller._execute
+	async def execute_then_stop(*a):
+		out = await original(*a)
+		rig.controller.closing = True
+		return out
+	rig.controller._execute = execute_then_stop
+	assert rig.send("turn_off")["outcome"] == "ok"
+	assert rig.republished == 0
+
+def test_shared_budget_bounds_the_result_across_many_slow_round_trips(monkeypatch):
+	import time
+	monkeypatch.setattr(ecobee_control, "COMMAND_BUDGET_SECONDS", 0.6)
+	monkeypatch.setattr(ecobee_control, "IO_TIMEOUT_SECONDS", 0.5)
+	monkeypatch.setattr(ecobee_control, "MIN_BUDGET_TO_WRITE_SECONDS", 0.1)
+	rig = Rig()
+	_setpoints(rig, heat=68, cool=72)
+	original_get = rig.pairing.get_characteristics
+	original_put = rig.pairing.put_characteristics
+	async def slow_get(ids):
+		await asyncio.sleep(0.2)
+		return await original_get(ids)
+	async def slow_put(chars):
+		await asyncio.sleep(0.2)
+		return await original_put(chars)
+	rig.pairing.get_characteristics, rig.pairing.put_characteristics = slow_get, slow_put
+	started = time.monotonic()
+	result = rig.send("set_setpoint", {"heat_setpoint": 74, "cool_setpoint": 78})
+	assert time.monotonic() - started < 0.9     # five round trips at 0.2 s would be 1.0 s unbudgeted
+	assert result["outcome"] in ("partial", "unknown", "failed")
+
+def test_a_command_with_no_budget_left_is_rejected_before_writing(monkeypatch):
+	monkeypatch.setattr(ecobee_control, "MIN_BUDGET_TO_WRITE_SECONDS", 999)
+	rig = Rig()
+	_assert_rejected(rig, rig.send("turn_off"), "time budget")
+
+def test_drain_cancels_a_command_stuck_in_readback_without_republishing():
+	import time
+	rig = Rig()
+	_mode(rig, "heat")
+	original = rig.pairing.get_characteristics
+	calls = [0]
+	async def readback_hangs(ids):
+		calls[0] += 1
+		if calls[0] >= 2:       # first call is the planner's pre-read; the next is the readback
+			await asyncio.sleep(30)
+		return await original(ids)
+	rig.pairing.get_characteristics = readback_hangs
+	async def go():
+		task = asyncio.create_task(rig.controller.handle(json.dumps(
+			{"id": "a", "command": "set_setpoint", "parameters": {"heat_setpoint": 68}, "ts": NOW})))
+		await asyncio.sleep(0.05)
+		rig.controller.closing = True
+		started = time.monotonic()
+		await rig.controller.drain(0.1)
+		assert time.monotonic() - started < 0.1 + ecobee_control.CANCEL_GRACE_SECONDS + 0.5
+		assert task.cancelled()
+	asyncio.run(go())
+	assert rig.republished == 0
+
+def test_drain_gives_up_on_a_task_that_ignores_cancellation(monkeypatch):
+	import time
+	monkeypatch.setattr(ecobee_control, "CANCEL_GRACE_SECONDS", 0.1)
+	rig = Rig()
+	async def stubborn():
+		while True:
+			try:
+				await asyncio.sleep(30)
+			except asyncio.CancelledError:
+				pass
+	async def go():
+		task = asyncio.ensure_future(stubborn())
+		rig.controller._inflight.add(task)
+		started = time.monotonic()
+		await rig.controller.drain(0.05)
+		assert time.monotonic() - started < 0.5
+		task.cancel()
+		task.add_done_callback(lambda t: None)
+	loop = asyncio.new_event_loop()
+	try:
+		loop.run_until_complete(go())
+	finally:
+		for t in asyncio.all_tasks(loop):
+			t.cancel()
+		loop.close()

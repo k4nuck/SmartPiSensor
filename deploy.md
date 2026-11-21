@@ -109,8 +109,9 @@ Watch with `mosquitto_sub -t 'upstate/#' -v`.
 ## Commands (gergy-incidents#1878)
 The service subscribes (QoS 1, non-retained) to `upstate/ecobee/<device_id>/set` and answers on `upstate/ecobee/<device_id>/result` (QoS 1, non-retained).
 Commands: `set_mode`, `set_setpoint`, `turn_off`, `turn_on`, `set_fan`, `set_preset`, `resume_schedule`; envelope `{"id","command","parameters","ts"}`, temperatures in F.
-Limits enforced on the Pi: heat targets 45-78 F, cool 65-90 F, auto deadband 3 F (the ecobee exposes none over HomeKit). Window: `ts`+30 s, `ts` at most 5 s in the future. A repeated `id` within 10 minutes returns the cached result and never writes again.
+Limits enforced on the Pi: heat targets 45-78 F, cool 65-90 F, auto deadband 3 F (the ecobee exposes none over HomeKit). Window: `ts`+20 s, `ts` at most 5 s in the future. A repeated `id` within 10 minutes returns the cached result and never writes again.
 Watch with `mosquitto_sub -t 'upstate/ecobee/+/result' -v`.
 
 Deploying this change on gergy-upstate: `cd ~/projects/dht22 && git pull && sudo systemctl restart ecobee-reader` (no new dependencies, no config change).
-**Before trusting `set_fan` / `set_preset` on the real thermostats**, confirm the fan-speed and hold-schedule value encodings (`FAN_VALUES`, `PRESET_VALUES` in `ecobee_control.py`) on site; they were written without ecobee hardware.
+`set_fan` writes the aiohomekit-documented speed (100 = on, 0 = auto). **Before trusting `set_preset` on the real thermostats**, confirm the hold-schedule value encoding (`PRESET_VALUES` in `ecobee_control.py`) on site; it was written without ecobee hardware.
+Timing: HA waits 25 s for `/result`. Discovery, pre-read, writes and readbacks share one 15 s budget from receipt, the `/result` is published first, and only then is the state refreshed.

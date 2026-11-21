@@ -200,6 +200,9 @@ class Poller:
 		self._layout_source = None
 		self._layout_at = 0
 		self.failures = 0
+		# poll_once runs from the schedule and from command refreshes. self.layout is mutable (a failed poll clears it),
+		# so a whole poll is one critical section; the connection's own serialization does not protect it.
+		self._poll_lock = asyncio.Lock()
 
 	def _layout_stale(self):
 		return (self.layout is None
@@ -225,6 +228,10 @@ class Poller:
 		return values
 
 	async def poll_once(self):
+		async with self._poll_lock:
+			return await self._poll_locked()
+
+	async def _poll_locked(self):
 		try:
 			values = await asyncio.wait_for(self._read(), READ_TIMEOUT_SECONDS)
 		except Exception as error:

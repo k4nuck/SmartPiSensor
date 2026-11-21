@@ -415,3 +415,23 @@ def test_result_is_published_not_retained_and_dropped_while_disconnected():
 	pub._on_connect(None, None, None, 0)
 	pub.publish_result({"id": "a"})
 	client.publish.assert_called_once_with("upstate/ecobee/living-room/result", '{"id": "a"}', qos=1, retain=False)
+
+
+def test_overlapping_polls_are_serialized_so_a_failure_cannot_clear_the_layout_mid_read():
+	"""One read fails while a second is in flight; without the lock the second finds layout None and fails too."""
+	class Slow(FakePairing):
+		async def get_characteristics(self, ids):
+			self.reads += 1
+			n = self.reads
+			await asyncio.sleep(0.05)
+			if n == 1:
+				raise OSError("blip")
+			return {i: {"value": 1} for i in ids}
+	pairing = Slow(_ecobee(), [])
+	publisher = FakePublisher()
+	poller = ecobee_service.Poller("d", "D", ecobee_service.ReadOnlyPairing(pairing), publisher)
+	async def go():
+		return await asyncio.gather(poller.poll_once(), poller.poll_once())
+	assert asyncio.run(go()) == [False, True]
+	assert poller.failures == 0
+	assert ("availability", False) not in publisher.events
