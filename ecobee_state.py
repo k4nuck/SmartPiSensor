@@ -59,6 +59,9 @@ def discover_layout(accessories):
 				"target": _first_char(accessory, S.THERMOSTAT, C.TEMPERATURE_TARGET),
 				"heat_threshold": _first_char(accessory, S.THERMOSTAT, C.TEMPERATURE_HEATING_THRESHOLD),
 				"cool_threshold": _first_char(accessory, S.THERMOSTAT, C.TEMPERATURE_COOLING_THRESHOLD),
+				# The thermostat's own presence sensors live in sibling services on the same accessory (aid 1).
+				"motion": _first_char(accessory, S.MOTION_SENSOR, C.MOTION_DETECTED),
+				"occupied": _first_char(accessory, S.OCCUPANCY_SENSOR, C.OCCUPANCY_DETECTED),
 			}
 			layout["thermostat"] = {k: _id(v) for k, v in chars.items() if v is not None}
 			layout["control"] = _control_ids(accessory)
@@ -113,7 +116,8 @@ def build_state(name, layout, values, ts):
 		target_heat = c_to_f(get("heat_threshold"))
 		target_cool = c_to_f(get("cool_threshold"))
 
-	occupancy_of = lambda ident: None if ident is None or _val(values, ident) is None else bool(_val(values, ident))
+	bool_of = lambda ident: None if ident is None or _val(values, ident) is None else bool(_val(values, ident))
+	occupancy_of = bool_of
 	return {
 		"name": name,
 		"temperature_f": c_to_f(get("temperature_f")),
@@ -122,6 +126,8 @@ def build_state(name, layout, values, ts):
 		"hvac_action": HVAC_ACTIONS.get(get("action")),
 		"target_heat_f": target_heat,
 		"target_cool_f": target_cool,
+		"motion": bool_of(t.get("motion")),
+		"occupied": bool_of(t.get("occupied")),
 		"sensors": [
 			{"name": s["name"], "temperature_f": c_to_f(_val(values, s["temperature_f"])), "occupancy": occupancy_of(s["occupancy"])}
 			for s in layout["sensors"]
