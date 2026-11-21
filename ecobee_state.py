@@ -22,10 +22,30 @@ def _first_char(accessory, service_type, char_type):
 def _id(char):
 	return None if char is None else (char.service.accessory.aid, char.iid)
 
+# The vendor characteristics sit in ecobee's own services, so search every service on the thermostat accessory.
+def _any_char(accessory, char_type):
+	for service in accessory.services:
+		if service.has(char_type):
+			return service[char_type]
+	return None
+
+# Command-only ids, kept out of layout["thermostat"] so the 60 s poll does not read them and the published state is unchanged.
+def _control_ids(accessory):
+	chars = {
+		"fan_write": C.VENDOR_ECOBEE_FAN_WRITE_SPEED, "fan_read": C.VENDOR_ECOBEE_FAN_READ_SPEED,
+		"set_hold": C.VENDOR_ECOBEE_SET_HOLD_SCHEDULE, "clear_hold": C.VENDOR_ECOBEE_CLEAR_HOLD,
+		"current_mode": C.VENDOR_ECOBEE_CURRENT_MODE,
+		"home_heat": C.VENDOR_ECOBEE_HOME_TARGET_HEAT, "home_cool": C.VENDOR_ECOBEE_HOME_TARGET_COOL,
+		"sleep_heat": C.VENDOR_ECOBEE_SLEEP_TARGET_HEAT, "sleep_cool": C.VENDOR_ECOBEE_SLEEP_TARGET_COOL,
+		"away_heat": C.VENDOR_ECOBEE_AWAY_TARGET_HEAT, "away_cool": C.VENDOR_ECOBEE_AWAY_TARGET_COOL,
+	}
+	found = {key: _id(_any_char(accessory, char_type)) for key, char_type in chars.items()}
+	return {k: v for k, v in found.items() if v is not None}
+
 # Returns {"thermostat": {field: (aid, iid)}, "sensors": [{"name", "temperature_f", "occupancy"}]} where each
 # value is the (aid, iid) to read. Room sensors are the non-thermostat accessories that expose a temperature.
 def discover_layout(accessories):
-	layout = {"thermostat": {}, "sensors": []}
+	layout = {"thermostat": {}, "control": {}, "sensors": []}
 	for accessory in accessories:
 		if accessory.services.first(service_type=S.THERMOSTAT) is not None:
 			if layout["thermostat"]:
@@ -41,6 +61,7 @@ def discover_layout(accessories):
 				"cool_threshold": _first_char(accessory, S.THERMOSTAT, C.TEMPERATURE_COOLING_THRESHOLD),
 			}
 			layout["thermostat"] = {k: _id(v) for k, v in chars.items() if v is not None}
+			layout["control"] = _control_ids(accessory)
 		else:
 			temperature = _first_char(accessory, S.TEMPERATURE_SENSOR, C.TEMPERATURE_CURRENT)
 			if temperature is None:

@@ -390,3 +390,48 @@ def test_service_stops_within_deadline_with_a_hung_read_and_closes_publishers(tm
 			await asyncio.wait_for(task, 2)
 	asyncio.run(go())
 	assert len(closed) == 1
+
+def test_publisher_subscribes_to_set_on_every_connect_and_hands_commands_over():
+	pub, client = _publisher()
+	got = []
+	pub.set_command_handler(got.append)
+	pub._on_connect(None, None, None, 0)
+	pub._on_connect(None, None, None, 0)
+	assert client.subscribe.call_args_list == [mock.call("upstate/ecobee/living-room/set", qos=1)] * 2
+	pub._on_message(None, None, mock.Mock(payload=b"{}", retain=False))
+	assert got == [b"{}"]
+
+def test_retained_command_is_never_acted_on():
+	pub, _ = _publisher()
+	got = []
+	pub.set_command_handler(got.append)
+	pub._on_message(None, None, mock.Mock(payload=b"{}", retain=True))
+	assert got == []
+
+def test_result_is_published_not_retained_and_dropped_while_disconnected():
+	pub, client = _publisher()
+	pub.publish_result({"id": "a"})
+	client.publish.assert_not_called()
+	pub._on_connect(None, None, None, 0)
+	pub.publish_result({"id": "a"})
+	client.publish.assert_called_once_with("upstate/ecobee/living-room/result", '{"id": "a"}', qos=1, retain=False)
+
+
+def test_overlapping_polls_are_serialized_so_a_failure_cannot_clear_the_layout_mid_read():
+	"""One read fails while a second is in flight; without the lock the second finds layout None and fails too."""
+	class Slow(FakePairing):
+		async def get_characteristics(self, ids):
+			self.reads += 1
+			n = self.reads
+			await asyncio.sleep(0.05)
+			if n == 1:
+				raise OSError("blip")
+			return {i: {"value": 1} for i in ids}
+	pairing = Slow(_ecobee(), [])
+	publisher = FakePublisher()
+	poller = ecobee_service.Poller("d", "D", ecobee_service.ReadOnlyPairing(pairing), publisher)
+	async def go():
+		return await asyncio.gather(poller.poll_once(), poller.poll_once())
+	assert asyncio.run(go()) == [False, True]
+	assert poller.failures == 0
+	assert ("availability", False) not in publisher.events
