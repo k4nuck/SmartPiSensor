@@ -24,6 +24,16 @@ KEYS = {
 	"device_name": False,
 	"temp_unique_id": False,
 	"hum_unique_id": False,
+	"shield_slug": False,
+	"shield_adb": False,
+	"shield_exit_node": False,
+}
+
+# Only shield_service.py reads these; the defaults are the upstate SHIELD, so other Pis never need to set them.
+SHIELD_DEFAULTS = {
+	"shield_slug": "upstate_tv",
+	"shield_adb": "192.168.1.62:5555",
+	"shield_exit_node": "ha-main-remote",
 }
 
 # The HA discovery identity is per-Pi: two Pis sharing these would overwrite each other's HA entities.
@@ -77,4 +87,5 @@ def load_config(path=None, environ=None):
 		# The FIFO sits beside the log because both need a directory the service user can write.
 		"fifo_path": values.get("fifo_path") or os.path.join(os.path.dirname(log_path), "temp.fifo"),
 		**{k: values.get(k) or default for k, default in IDENTITY_DEFAULTS.items()},
+		**{k: values.get(k) or default for k, default in SHIELD_DEFAULTS.items()},
 	}
