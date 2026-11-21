@@ -97,3 +97,35 @@ def test_port_in_use_binds_nothing():
 		s.close()
 		busy.close()
 	asyncio.run(go())
+
+# An idle, long-lived connection (like a Remote v2 or adb session) must not stop run() from returning on stop.
+def test_run_shuts_down_with_active_connection():
+	async def go():
+		async def hold_open(r, w):
+			await r.read()
+		upstream = await asyncio.start_server(hold_open, "127.0.0.1", 0)
+		uport = upstream.sockets[0].getsockname()[1]
+		fport = _free_port()
+		async def open_conn(host, port):
+			return await asyncio.open_connection(host, uport)
+		stop = asyncio.Event()
+		task = asyncio.ensure_future(tcp_forwarder.run("127.0.0.1", "x", [fport], stop, connect=open_conn))
+		try:
+			for _ in range(50):
+				try:
+					r, w = await asyncio.open_connection("127.0.0.1", fport)
+					break
+				except OSError:
+					await asyncio.sleep(0.05)
+			w.write(b"x")
+			await w.drain()
+			await asyncio.sleep(0.2)  # let the forward get established
+			stop.set()
+			await asyncio.wait_for(task, 3)
+			# The client side was closed by the forwarder, not left hanging.
+			assert await asyncio.wait_for(r.read(100), 3) == b""
+			w.close()
+		finally:
+			task.cancel()
+			upstream.close()
+	asyncio.run(go())

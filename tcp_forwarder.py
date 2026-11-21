@@ -62,9 +62,11 @@ async def _pipe(reader, writer):
 		except (ConnectionError, OSError, RuntimeError):
 			pass
 
-async def _handle(client_reader, client_writer, target, port, connect):
+async def _handle(client_reader, client_writer, target, port, connect, tasks):
 	peer = client_writer.get_extra_info("peername")
 	upstream_writer = None
+	task = asyncio.current_task()
+	tasks.add(task)
 	try:
 		upstream_reader, upstream_writer = await asyncio.wait_for(
 			connect(target, port), CONNECT_TIMEOUT_SECONDS)
@@ -73,17 +75,20 @@ async def _handle(client_reader, client_writer, target, port, connect):
 		# A powered-off SHIELD is routine; the client just sees its connection close.
 		logging.info("forward %s -> %s:%d failed: %s", peer, target, port, e or type(e).__name__)
 	finally:
+		tasks.discard(task)
 		for w in (client_writer, upstream_writer):
 			if w is not None:
 				w.close()
 
 # `connect` is injectable so tests can point the upstream side at a local fake.
-async def start_servers(bind, target, ports, connect=asyncio.open_connection):
+# `tasks` collects the live per-connection handlers so run() can cancel them on shutdown.
+async def start_servers(bind, target, ports, connect=asyncio.open_connection, tasks=None):
+	tasks = set() if tasks is None else tasks
 	servers = []
 	try:
 		for port in ports:
 			servers.append(await asyncio.start_server(
-				lambda r, w, p=port: _handle(r, w, target, p, connect), host=bind, port=port))
+				lambda r, w, p=port: _handle(r, w, target, p, connect, tasks), host=bind, port=port))
 	except OSError:
 		# All or nothing: a half-bound forwarder would look healthy to systemd while a port is dead.
 		for s in servers:
@@ -91,12 +96,20 @@ async def start_servers(bind, target, ports, connect=asyncio.open_connection):
 		raise
 	return servers
 
-async def run(bind, target, ports, stop):
-	servers = await start_servers(bind, target, ports)
+async def run(bind, target, ports, stop, connect=asyncio.open_connection):
+	tasks = set()
+	servers = await start_servers(bind, target, ports, connect=connect, tasks=tasks)
 	logging.info("forwarding %s:%s -> %s", bind, ports, target)
 	await stop.wait()
 	for s in servers:
 		s.close()
+	# Python 3.12+ Server.wait_closed() blocks until every accepted connection ends, and a long-lived remote/adb
+	# session never would, so systemd would SIGKILL us. Cancel the handlers (their finally closes both sockets) first.
+	# Listeners are already closed above, so no new handler can join `tasks` while we drain it.
+	pending = list(tasks)
+	for t in pending:
+		t.cancel()
+	await asyncio.gather(*pending, return_exceptions=True)
 	await asyncio.gather(*(s.wait_closed() for s in servers), return_exceptions=True)
 
 def parse_args(argv, environ=None):
