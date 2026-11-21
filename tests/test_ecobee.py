@@ -31,6 +31,8 @@ def _ecobee(with_sensor=True):
 			(C.HEATING_COOLING_CURRENT, 1), (C.TEMPERATURE_TARGET, 22), (C.TEMPERATURE_HEATING_THRESHOLD, 20),
 			(C.TEMPERATURE_COOLING_THRESHOLD, 25)]:
 		svc.add_char(char, value=value)
+	t.add_service(S.MOTION_SENSOR).add_char(C.MOTION_DETECTED, value=0)
+	t.add_service(S.OCCUPANCY_SENSOR).add_char(C.OCCUPANCY_DETECTED, value=0)
 	accessories.add_accessory(t)
 	if with_sensor:
 		s = _accessory(2, "Bedroom")
@@ -60,11 +62,12 @@ def test_state_matches_the_published_contract():
 		layout["thermostat"]["target"]: {"value": 22},
 		layout["thermostat"]["heat_threshold"]: {"value": 20}, layout["thermostat"]["cool_threshold"]: {"value": 25},
 		sensor["temperature_f"]: {"value": 19.0}, sensor["occupancy"]: {"value": 1},
+		layout["thermostat"]["motion"]: {"value": 1}, layout["thermostat"]["occupied"]: {"value": 0},
 	}
 	state = build_state("Living Room", layout, values, 1000)
 	assert state == {
 		"name": "Living Room", "temperature_f": 70.7, "humidity": 45, "hvac_mode": "heat_cool", "hvac_action": "heating",
-		"target_heat_f": 68.0, "target_cool_f": 77.0,
+		"target_heat_f": 68.0, "target_cool_f": 77.0, "motion": True, "occupied": False,
 		"sensors": [{"name": "Bedroom", "temperature_f": 66.2, "occupancy": True}], "ts": 1000,
 	}
 
@@ -82,8 +85,17 @@ def test_missing_fields_are_null_not_errors():
 	state = build_state("Backroom", layout, values, 5)
 	assert state["temperature_f"] == 68.0
 	assert state["sensors"] == [{"name": "Den", "temperature_f": None, "occupancy": None}]
-	for key in ("humidity", "hvac_mode", "hvac_action", "target_heat_f", "target_cool_f"):
+	for key in ("humidity", "hvac_mode", "hvac_action", "target_heat_f", "target_cool_f", "motion", "occupied"):
 		assert state[key] is None
+
+def test_thermostat_presence_is_null_when_unreadable_and_false_when_clear():
+	layout = discover_layout(_ecobee(with_sensor=False))
+	t = layout["thermostat"]
+	clear = build_state("x", layout, {t["motion"]: {"value": 0}, t["occupied"]: {"value": 0}}, 1)
+	assert (clear["motion"], clear["occupied"]) == (False, False)
+	err = build_state("x", layout, {t["motion"]: {"status": -70402}}, 1)
+	assert (err["motion"], err["occupied"]) == (None, None)
+	assert t["motion"] in read_ids(layout) and t["occupied"] in read_ids(layout)
 
 def test_single_setpoint_modes_use_the_target_temperature_even_with_stale_thresholds():
 	layout = discover_layout(_ecobee(with_sensor=False))
