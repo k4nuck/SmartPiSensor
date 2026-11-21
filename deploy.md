@@ -131,3 +131,33 @@ Unit `/etc/systemd/system/shield-exit-node.service` (same shape as the ecobee on
 The service starts with no network or SHIELD: MQTT retries on its own and each adb call reconnects once before reporting offline.
 
 **Unverified:** "off" is the same broadcast with an empty `exitNode`. Confirm on site that this clears the exit node on Tailscale 1.104.6 (the `ip route get` check will report `failed` if it does not).
+
+# SHIELD tailnet forwarder (gergy-upstate Pi, gergy-incidents#1896)
+
+`tcp_forwarder.py` lets ha-main reach the upstate SHIELD's Android TV Remote (6466 pairing, 6467 control) and adb (5555) through this Pi. The SHIELD's own tailnet address does not answer those ports; the Pi reaches it on the in-laws' LAN.
+Stdlib only, so any python3 works (no venv). Nothing about the SHIELD is hard-coded: `--bind`, `--target`, `--ports` (or `TCP_FORWARDER_BIND` / `_TARGET` / `_PORTS`; ports default `6466,6467,5555`).
+It listens **only** on the address given by `--bind`, which must be a tailnet address (100.64.0.0/10); `0.0.0.0`, a LAN IP or a hostname is refused (exit 2), so the in-laws' LAN never sees the listeners. All ports bind or none do.
+
+Unit `/etc/systemd/system/shield-forwarder.service`:
+
+```ini
+[Unit]
+Description=SHIELD tailnet TCP forwarder
+After=network-online.target tailscaled.service
+Wants=network-online.target tailscaled.service
+
+[Service]
+User=k4nuck
+WorkingDirectory=/home/k4nuck/projects/dht22
+ExecStart=/usr/bin/python3 tcp_forwarder.py --bind 100.123.50.43 --target 192.168.1.62
+Restart=always
+RestartSec=10
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Deploy: `cd ~/projects/dht22 && git pull`, install the unit, `sudo systemctl daemon-reload && sudo systemctl enable --now shield-forwarder`.
+Verify on the Pi: `ss -ltn | grep -E ':(6466|6467|5555)\b'` shows only `100.123.50.43:<port>`, never `0.0.0.0` or `*`. From ha-main: `nc -vz 100.123.50.43 6466` and `6467` connect.
+If the tailnet address is not up yet at boot the service exits 1 and systemd retries every 10 s. A powered-off SHIELD only closes that one client connection. This does not touch `shield_service.py` or the exit-node topics.
